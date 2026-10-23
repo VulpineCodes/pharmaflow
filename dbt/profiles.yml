@@ -1,0 +1,7 @@
+# Local dev profile — DuckDB only, no credentials. Not for production.
+pharmaflow:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: pharmaflow.duckdb

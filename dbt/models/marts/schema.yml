@@ -1,0 +1,18 @@
+version: 2
+models:
+  - name: stg_inventory
+    columns:
+      - name: sku
+        tests: [not_null, unique]
+      - name: quantity_on_hand
+        tests: [not_null]
+  - name: stg_sales
+    columns:
+      - name: sale_id
+        tests: [not_null, unique]
+  - name: inventory_current
+    columns:
+      - name: sku
+        tests: [not_null, unique]
+      - name: quantity_on_hand
+        tests: [not_null]

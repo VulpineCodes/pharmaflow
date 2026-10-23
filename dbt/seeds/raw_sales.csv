@@ -1,0 +1,4 @@
+sale_id,sku,quantity_sold,sale_date,unit_price,_file_hash,_imported_at
+S-1001,MED-001,10,2026-10-20,7.00,csv-seed,2026-10-22T00:00:00
+S-1002,MED-002,3,2026-10-20,5.50,csv-seed,2026-10-22T00:00:00
+S-1003,MED-004,2,2026-10-21,4.25,csv-seed,2026-10-22T00:00:00

@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+pydantic>=2.6
+duckdb>=0.10
+psycopg[binary]>=3.1
+# dbt / airflow are heavy, milestone installs — see requirements-dev / docs:
+# dbt-postgres, dbt-duckdb, apache-airflow (pinned per deployment, not needed for core)

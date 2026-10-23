@@ -1,0 +1,8 @@
+pytest>=8.0
+httpx>=0.27  # for FastAPI TestClient (M5: verified, tests/test_api.py)
+fastapi>=0.110  # M5 API tests import api.app
+uvicorn>=0.29
+python-multipart>=0.0.9  # required by FastAPI file uploads
+pyyaml>=6.0  # CI workflow YAML validation (benchmarks/docs tooling)
+duckdb>=0.10  # M3 analytics/transform tests (verified with 2.0.0 in the local venv — module reports duckdb.__version__ 2.0.0)
+dbt-duckdb>=1.9  # M3: verified dbt-core 1.12.6 / dbt-duckdb 1.11.0; heavy, install only for dbt work

@@ -1,0 +1,41 @@
+# Local stack placeholders — Docker is NOT available in the current build env (verified).
+# This file is the intended local topology; core Python tests do not need it.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: {POSTGRES_DB: pharmaflow, POSTGRES_USER: pharmaflow, POSTGRES_PASSWORD: change-me-local-only}
+    ports: ["5432:5432"]
+    # 001_initial_schema.sql mirrors the verified SQLite schema (docs/POSTGRES.md);
+    # Postgres runs it once on first init of a fresh pgdata volume. Untested locally.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql:ro
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U pharmaflow"], interval: 5s, retries: 10}
+  api:
+    build: .
+    command: uvicorn api.app:app --host 0.0.0.0 --port 8000
+    environment: {DATABASE_URL: postgresql://pharmaflow:change-me-local-only@postgres:5432/pharmaflow}
+    ports: ["8000:8000"]
+    depends_on: {postgres: {condition: service_healthy}}
+  redpanda:
+    # M4 streaming — UNTESTED locally (no Docker in the build env, same as
+    # the other services here). Bring-up + verification checklist:
+    # docs/STREAMING_RUNBOOK.md. The tested streaming path is the file-log
+    # broker in pharmaflow/streaming.py, which needs no broker at all.
+    image: redpandadata/redpanda:latest
+    command: >
+      redpanda start --smp 1 --memory 512M --overprovisioned
+      --node-id 0 --check=false
+      --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      --advertised-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:19092
+    ports: ["19092:9092", "19644:9644"]
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+  prometheus:
+    image: prom/prometheus:latest
+    ports: ["9090:9090"]  # scrape api /metrics (Milestone 6 dashboard)
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+volumes: {pgdata: {}, redpanda_data: {}}

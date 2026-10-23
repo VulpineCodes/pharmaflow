@@ -1,0 +1,6 @@
+sku,product_name,quantity_on_hand,unit_cost,expiry_date,reorder_point,supplier,batch,_file_hash,_imported_at
+MED-001,Paracetamol 500mg 100 tabs,120,4.50,2027-06-30,20,Synthetic Supplier A,B001,csv-seed,2026-10-22T00:00:00
+MED-002,Ibuprofen 200mg 50 tabs,8,3.20,2027-03-15,15,Synthetic Supplier A,B002,csv-seed,2026-10-22T00:00:00
+MED-003,Vitamin C 1000mg 30 tabs,45,6.00,2026-11-10,10,Synthetic Supplier B,B003,csv-seed,2026-10-22T00:00:00
+MED-004,Antiseptic Solution 250ml,30,2.75,2028-01-31,10,Synthetic Supplier B,B004,csv-seed,2026-10-22T00:00:00
+MED-005,Cough Syrup 120ml,5,5.10,2026-09-01,10,Synthetic Supplier C,B005,csv-seed,2026-10-22T00:00:00

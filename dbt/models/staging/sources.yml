@@ -1,0 +1,9 @@
+version: 2
+sources:
+  - name: raw
+    # Local DuckDB: seeds land in the `main` schema (see dbt/seeds/).
+    # In a warehouse deployment this would point at the real raw schema.
+    schema: main
+    tables:
+      - name: raw_inventory
+      - name: raw_sales

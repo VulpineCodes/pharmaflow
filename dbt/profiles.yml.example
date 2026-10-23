@@ -1,0 +1,4 @@
+pharmaflow:
+  target: dev
+  outputs:
+    dev: {type: duckdb, path: pharmaflow.duckdb}  # local; prod target uses postgres

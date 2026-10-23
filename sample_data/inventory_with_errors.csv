@@ -1,0 +1,8 @@
+sku,product_name,quantity_on_hand,unit_cost,expiry_date,reorder_point,supplier,batch
+MED-101,ORS Sachets 20 pack,60,1.80,2027-08-31,10,Synthetic Supplier A,C001
+MED-102,Bandages Box,25,2.00,2027-05-31,5,Synthetic Supplier A,C002
+MED-101,ORS Sachets 20 pack,60,1.80,2027-08-31,10,Synthetic Supplier A,C001
+,No SKU Product,10,1.00,2027-01-01,5,Synthetic Supplier A,C003
+MED-103,Bad Quantity Product,not-a-number,1.00,2027-01-01,5,Synthetic Supplier A,C004
+MED-104,Negative Stock,-5,1.00,2027-01-01,5,Synthetic Supplier A,C005
+MED-105,Good After Errors,40,3.00,2027-12-31,5,Synthetic Supplier A,C006

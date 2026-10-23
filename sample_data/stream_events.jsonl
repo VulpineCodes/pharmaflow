@@ -1,0 +1,4 @@
+{"event_type": "StockReceived", "event_id": "evt-0001", "sku": "MED-001", "product_name": "Paracetamol 500mg 100 tabs", "quantity": 100, "reorder_point": 20, "unit_cost": 4.50, "expiry_date": "2027-06-30", "supplier": "Synthetic Supplier A", "batch": "B001"}
+{"event_type": "StockReceived", "event_id": "evt-0002", "sku": "MED-002", "product_name": "Ibuprofen 200mg 50 tabs", "quantity": 50, "reorder_point": 15, "unit_cost": 3.20, "expiry_date": "2027-03-15", "supplier": "Synthetic Supplier A", "batch": "B002"}
+{"event_type": "SaleRecorded", "event_id": "evt-0003", "sale_id": "S-2001", "sku": "MED-001", "quantity_sold": 10, "unit_price": 6.00, "sale_date": "2026-10-22"}
+{"event_type": "InventoryAdjusted", "event_id": "evt-0004", "sku": "MED-002", "delta": -2, "reason": "damaged packaging (synthetic)"}
