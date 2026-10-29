@@ -1,15 +1,16 @@
-# Streaming runbook — the real-broker (Redpanda/Kafka) path
+# Streaming runbook: the real-broker (Redpanda/Kafka) path
 
 > **Status: UNVERIFIED.** Everything on this page describes how to run
 > PharmaFlow streaming against a real Redpanda broker **once Docker is
 > available**. None of it has been executed in the current environment
 > (no Docker, no broker). The path that *has* been executed and tested
-> is the file-log broker — see "Verified path" below.
+> is the file-log broker. That is the path described under
+> "Verified path" below.
 
-## Verified path (file-log broker) — this is what the tests run
+## Verified path (file-log broker): this is what the tests run
 
 ```bash
-.venv/bin/python -m pytest -q        # 45 passed (incl. 10 streaming tests)
+.venv/bin/python -m pytest -q        # 76 passed (incl. 10 streaming tests)
 
 .venv/bin/python -m pharmaflow stream-produce \
   --log-dir /tmp/m4-demo/log --events sample_data/stream_events.jsonl
@@ -30,7 +31,7 @@ processing; event-id dedupe table (`processed_events`) in the SQLite
 store makes redelivery after a crash a no-op; poison events are
 dead-lettered to `pharmaflow.inventory.dlq` and their offsets commit.
 
-## Unverified path (real broker) — steps to run when Docker exists
+## Unverified path (real broker): steps to run when Docker exists
 
 1. Start Redpanda (service defined in `docker-compose.yml`):
 
@@ -69,8 +70,8 @@ dead-lettered to `pharmaflow.inventory.dlq` and their offsets commit.
 
 5. **Verification checklist before removing the "unverified" label:**
    - [ ] `KafkaBroker` produce/consume round-trip against Redpanda
-         (the adapter's group/offset methods are currently stubs —
-         real Kafka consumption is group-based polling, so expect the
+         (the adapter's group/offset methods are currently stubs.
+         Real Kafka consumption is group-based polling, so expect the
          adapter, not the consumer, to need the most work);
    - [ ] crash/restart redelivery test re-run against the real broker
          with the same expected counts as `tests/test_streaming.py`;
@@ -83,7 +84,7 @@ dead-lettered to `pharmaflow.inventory.dlq` and their offsets commit.
 - **At-least-once delivery; exactly-once application** via the
   `processed_events` event-id dedupe table in the operational store.
 - Offsets are committed **after** processing, never before.
-- A poison event is dead-lettered once and its offset commits — the
+- A poison event is dead-lettered once and its offset commits. The
   consumer never retries a deterministically-invalid event forever.
 - Consumer groups (`reconciliation-v1`, `alerts-v1`) hold independent
   offsets; either can lag, crash, and catch up without affecting the

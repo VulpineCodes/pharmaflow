@@ -11,7 +11,14 @@ Behaviour matches the in-memory ``PharmaStore``:
 * inventory, sales, quarantine and audit rows are persisted and queryable
   after the store is closed and reopened;
 * schema creation is idempotent: ``CREATE TABLE IF NOT EXISTS`` plus a
-  ``schema_version`` table, safe to run on every open.
+  ``schema_version`` table, safe to run on every open. Version 2 (M9)
+  adds the ``pipeline_runs`` table; opening a version-1 database
+  migrates it additively (new table only, existing rows untouched)
+  and bumps the recorded version to 2.
+* pipeline runs (M9): ``record_pipeline_run`` / ``latest_pipeline_run``
+  / ``list_pipeline_runs`` persist ``PipelineResult`` dicts (see
+  ``orchestration.PipelineResult.to_dict``) so the last run survives a
+  process restart and can be served by the API.
 
 Each mutation is committed immediately. That is deliberate: a process that
 dies mid-file has already durably recorded the rows it processed, and the
@@ -22,6 +29,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -36,7 +44,7 @@ from .models import (
 )
 from .quarantine import QuarantineStore
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -95,11 +103,49 @@ CREATE TABLE IF NOT EXISTS audit (
     file_hash TEXT NOT NULL,
     details TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    logical_date TEXT NOT NULL,
+    succeeded INTEGER NOT NULL,
+    failed_task TEXT,
+    recorded_at TEXT NOT NULL,
+    result_json TEXT NOT NULL
+);
 """
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class StoredPipelineRun:
+    """One persisted daily-pipeline run (M9).
+
+    ``result_dict`` is the ``PipelineResult.to_dict()`` payload exactly
+    as recorded: ``{"logical_date": ..., "outcomes": [...]}``. It is
+    kept as plain JSON data (not a reconstructed ``PipelineResult``)
+    so storage never depends on the orchestration module — callers
+    rebuild with ``PipelineResult.from_dict`` when they need behaviour.
+    ``run_id`` is the append-only row id: ordering by it is insertion
+    order, which is the definition of "latest" even if clocks skew.
+    """
+
+    run_id: int
+    logical_date: date
+    recorded_at: str
+    result_dict: dict
+
+    @property
+    def succeeded(self) -> bool:
+        return all(o.get("status") == "success" for o in self.result_dict.get("outcomes", []))
+
+    @property
+    def failed_task(self) -> str | None:
+        for o in self.result_dict.get("outcomes", []):
+            if o.get("status") == "failed":
+                return o.get("name")
+        return None
 
 
 class SqliteStore:
@@ -121,12 +167,24 @@ class SqliteStore:
 
     # --- lifecycle ----------------------------------------------------
     def _init_schema(self) -> None:
-        """Idempotent: safe to call on every open / repeatedly."""
+        """Idempotent: safe to call on every open / repeatedly.
+
+        Migration is additive: ``CREATE TABLE IF NOT EXISTS`` adds any
+        table a database predates (e.g. ``pipeline_runs`` on a v1 file),
+        and the recorded version is then bumped to ``SCHEMA_VERSION``.
+        No existing table or row is altered or deleted, so a v1 database
+        keeps its inventory, imports, quarantine, and audit rows.
+        """
         self._conn.executescript(_SCHEMA)
         row = self._conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
         if row is None:
             self._conn.execute(
                 "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (SCHEMA_VERSION, _now()),
+            )
+        elif int(row["version"]) < SCHEMA_VERSION:
+            self._conn.execute(
+                "UPDATE schema_version SET version = ?, applied_at = ?",
                 (SCHEMA_VERSION, _now()),
             )
         self._conn.commit()
@@ -260,6 +318,66 @@ class SqliteStore:
             )
             for r in rows
         ]
+
+    # --- pipeline runs (M9) -------------------------------------------------
+    def record_pipeline_run(self, result_dict: dict) -> int:
+        """Append one completed pipeline run; return its run id.
+
+        Every run is appended, including failed ones and re-runs of the
+        same logical date — run history is the audit trail, and ingest
+        idempotency (not run-history overwriting) is what keeps a
+        re-run from duplicating inventory. ``result_dict`` must be a
+        ``PipelineResult.to_dict()`` payload; outcome ``result`` values
+        are JSON-encoded with ``default=str`` so an exotic value can
+        never break recording of an otherwise finished run.
+        """
+        outcomes = result_dict.get("outcomes", [])
+        succeeded = 1 if all(o.get("status") == "success" for o in outcomes) else 0
+        failed_task = next(
+            (o.get("name") for o in outcomes if o.get("status") == "failed"), None
+        )
+        cur = self._conn.execute(
+            """
+            INSERT INTO pipeline_runs
+                (logical_date, succeeded, failed_task, recorded_at, result_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(result_dict["logical_date"]),
+                succeeded,
+                failed_task,
+                _now(),
+                json.dumps(result_dict, default=str, sort_keys=True),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def count_pipeline_runs(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM pipeline_runs").fetchone()
+        return int(row["n"])
+
+    def latest_pipeline_run(self) -> StoredPipelineRun | None:
+        """The most recently recorded run, or ``None`` if no run exists."""
+        rows = self.list_pipeline_runs(limit=1)
+        return rows[0] if rows else None
+
+    def list_pipeline_runs(self, limit: int = 20) -> list[StoredPipelineRun]:
+        """Runs newest-first. ``limit`` is clamped to [1, 100]."""
+        limit = max(1, min(int(limit), 100))
+        rows = self._conn.execute(
+            "SELECT * FROM pipeline_runs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [self._stored_run_from_row(r) for r in rows]
+
+    @staticmethod
+    def _stored_run_from_row(r) -> StoredPipelineRun:
+        return StoredPipelineRun(
+            run_id=int(r["id"]),
+            logical_date=date.fromisoformat(r["logical_date"]),
+            recorded_at=r["recorded_at"],
+            result_dict=json.loads(r["result_json"]),
+        )
 
     # --- read views (fresh snapshots from the DB) -----------------------
     @property

@@ -1,11 +1,11 @@
-# Postgres path — code only, NOT run locally
+# Postgres path: code only, NOT run locally
 
 > **Honesty status (2026-10-22):** Postgres has **not** been executed for
 > PharmaFlow. There is no Postgres server and no Docker in the current build
 > environment. The verified durable persistence path at M2 is SQLite
 > (`pharmaflow/sqlite_store.py`, stdlib `sqlite3`, covered by tests).
 > This document describes the prepared Postgres path so it can be brought
-> up and verified when a server is available — it is not evidence that it works yet.
+> up and verified when a server is available. It is not evidence that it works yet.
 
 ## What exists
 
@@ -19,7 +19,9 @@
 (`pharmaflow/store.py`) as `PharmaStore` (in-memory) and `SqliteStore`:
 file/row hash idempotency, inventory upserts, sales, quarantine, audit,
 and per-import summaries for the data-quality report. Ingestion code does
-not change when the store changes.
+not change when the store changes. The migration inserts schema
+version 1 and has no `pipeline_runs` table, so the Postgres store
+does not persist pipeline runs (the M9 history is SQLite only).
 
 ## Dialect differences from SQLite
 
@@ -30,7 +32,7 @@ not change when the store changes.
 - Upserts / ignored inserts use the same `ON CONFLICT ... DO NOTHING /
   DO UPDATE` shape in both dialects.
 
-## Bring-up checklist (to do when a server exists — do not skip verification)
+## Bring-up checklist (to do when a server exists; do not skip verification)
 
 1. Start Postgres, e.g. `docker compose up -d postgres` (fresh volume runs
    `001_initial_schema.sql` automatically), or apply the migration

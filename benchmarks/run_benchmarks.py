@@ -1,4 +1,4 @@
-"""PharmaFlow benchmarks — M6 methodology, M7 re-run.
+"""PharmaFlow benchmarks. M6 methodology, re-run in M7.
 
 Generates synthetic inventory CSVs deterministically (seed 42) at
 1k / 10k / 50k rows and times, against the durable SQLite store:
@@ -7,8 +7,8 @@ Generates synthetic inventory CSVs deterministically (seed 42) at
 * dedupe re-import of the identical bytes (file-hash no-op path),
 * reconciliation (expected-vs-actual over all SKUs, with ~1% drift
   injected into the expected counts so discrepancies are produced),
-* a DuckDB analytics run (``pharmaflow.analytics.run_analytics`` —
-  loads the store into DuckDB and aggregates in SQL).
+* a DuckDB analytics run. ``pharmaflow.analytics.run_analytics``
+  loads the store into DuckDB and aggregates in SQL.
 
 Writes ``benchmarks/RESULTS.md`` next to this file with the machine /
 Python / library context and the measured numbers. Since M7 the file
@@ -21,8 +21,9 @@ loader, preserved verbatim below as ``M6_BEFORE``) and the fresh
 HONESTY: these are local, single-machine, single-run figures on the
 machine described in RESULTS.md. They are NOT production-scale numbers
 and no production throughput is claimed. SQLite commits per row by
-design (crash-safety over speed — see docs/FAILURE_MODES.md), so
-ingestion rows/sec here reflects that trade-off on this hardware.
+design. That trades speed for crash safety (see
+docs/FAILURE_MODES.md), so ingestion rows/sec here reflects that
+trade-off on this hardware.
 """
 from __future__ import annotations
 
@@ -182,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     lines = [
-        "# PharmaFlow — Benchmark Results",
+        "# PharmaFlow Benchmark Results",
         "",
         "> **What these numbers are:** local, single-machine, single-run",
         "> measurements from `benchmarks/run_benchmarks.py` on the machine",
@@ -192,15 +193,15 @@ def main(argv: list[str] | None = None) -> int:
         "> different numbers; that is expected and is why the conditions",
         "> are recorded.",
         "",
-        "Two labelled runs are kept side by side: **M6 (before)** — the",
-        "original row-by-row DuckDB loader — and **M7 (after)** — the",
+        "Two labelled runs are kept side by side. **M6 (before)** used the",
+        "original row-by-row DuckDB loader. **M7 (after)** used the",
         "same methodology and seed, with the M7 appender bulk load.",
         "Analytical results are identical between the two loaders; that",
         "is asserted by the correctness gate in `tests/test_m7.py`",
         "(old vs new loader, sample data + generated 5k dataset), not",
         "just by the totals asserted inside this benchmark.",
         "",
-        f"## M6 (before) — {M6_BEFORE_DATE}, commit {M6_BEFORE_COMMIT}",
+        f"## M6 (before): {M6_BEFORE_DATE}, commit {M6_BEFORE_COMMIT}",
         "",
         "Conditions: same format as the M7 run below (same machine class,",
         "Python 3.12.3, duckdb 2.0.0, seed 42 datasets, SQLite store in a",
@@ -214,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         lines.append(fmt_row(*b))
     lines += [
         "",
-        f"## M7 (after) — {run_date}, bulk-load loader (the M7 commit containing this file; parent {M6_BEFORE_COMMIT})",
+        f"## M7 (after): {run_date}, bulk-load loader (the M7 commit containing this file; parent {M6_BEFORE_COMMIT})",
         "",
         "### Conditions",
         "",
@@ -227,10 +228,11 @@ def main(argv: list[str] | None = None) -> int:
         f"(seed {SEED}) by `generate_csv_bytes` in `run_benchmarks.py`; "
         "unique SKUs `BENCH-000000…`, 8 rotating synthetic products.",
         "- Store: `SqliteStore` (SQLite file in a temp dir). The SQLite "
-        "store commits per row by design (crash-safety over speed — see "
-        "`docs/FAILURE_MODES.md`); ingestion rows/sec reflects that.",
+        "store commits per row by design. That trades speed for "
+        "crash safety (see `docs/FAILURE_MODES.md`); ingestion rows/sec "
+        "reflects that.",
         "- Timing: `time.perf_counter()` around each operation, one run "
-        "per size (no warm-up, no averaging) — treat small timings as "
+        "per size (no warm-up, no averaging). Treat small timings as "
         "noisy.",
         "- Reconciliation: expected counts = actual counts with +7 drift "
         "injected into every 100th SKU (~1% discrepancies).",
@@ -252,8 +254,8 @@ def main(argv: list[str] | None = None) -> int:
     if speedup is not None:
         lines += [
             "",
-            f"**Analytics at 50,000 rows: {before_50k[5]:.3f}s (M6) → "
-            f"{after_50k['analytics_s']:.3f}s (M7) — {speedup:.1f}× faster**, "
+            f"**Analytics at 50,000 rows: {before_50k[5]:.3f}s (M6) to "
+            f"{after_50k['analytics_s']:.3f}s (M7), {speedup:.1f}x faster**, "
             "with identical analytical results (see the correctness gate "
             "above).",
         ]
@@ -261,12 +263,13 @@ def main(argv: list[str] | None = None) -> int:
         "",
         "Correctness at these sizes (row counts, dedupe no-op, discrepancy",
         "counts, analytics SKU totals) is asserted inside the benchmark run",
-        "itself and in `tests/test_benchmarks.py` — timing is never asserted.",
+        "itself and in `tests/test_benchmarks.py`. Timing is never asserted.",
         "",
         "## Reading the numbers",
         "",
         "- Ingestion scales roughly linearly (thousands of rows/s at every",
-        "  size on this machine) — the per-row-commit SQLite trade-off above.",
+        "  size on this machine). That reflects the per-row-commit SQLite "
+        "trade-off above.",
         "- Dedupe re-import is a file-hash check: near-instant at every",
         "  size, by design.",
         "- M6's analytics figure was dominated by *loading*: profiling at",
@@ -278,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
         "  ~0.13s + appender ~0.12s + date conversion / overhead).",
         "  Two plausible bulk paths were measured and rejected:",
         "  `executemany` is per-row in DuckDB's Python client (~50.6s at",
-        "  50k — no better), and the sqlite-scanner extension is not",
+        "  50k, no better), and the sqlite-scanner extension is not",
         "  available offline (DuckDB tries to download it).",
         "- What remains in the M7 analytics time is mostly the load",
         "  itself (~0.4s at 50k) plus DuckDB connection/setup; the SQL",

@@ -1,7 +1,8 @@
-# dbt project — executed in M3
+# dbt project: executed in M3
 
 Verified locally 2026-10-22 (dbt-core 1.12.6, dbt-duckdb 1.11.0, DuckDB,
-Python 3.12 venv):
+Python 3.12 venv). Run green again on 2026-10-28 with the same
+PASS counts (seed 2, run 3, test 8).
 
 ```bash
 pip install dbt-duckdb          # one install; see ../STATUS.md
@@ -18,5 +19,5 @@ the DuckDB seeds land. `profiles.yml` is a local DuckDB profile (no
 credentials).
 
 The same model SQL is also executed without dbt by
-`pharmaflow/transform.py` (used by the local daily-pipeline runner);
-both paths were run green in M3 — see `../STATUS.md`.
+`pharmaflow/transform.py` (used by the local daily-pipeline runner).
+Both paths were run green in M3. See `../STATUS.md`.

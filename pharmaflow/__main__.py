@@ -36,6 +36,11 @@ def main(argv=None) -> int:
     p_run.add_argument("--data-dir", default="sample_data", help="Directory containing inventory.csv / sales.csv")
     p_run.add_argument("--date", default=None, help="Logical date YYYY-MM-DD (default: today)")
     p_run.add_argument("--retries", type=int, default=2, help="Retries per task after the first attempt (default: 2)")
+    p_pr = sub.add_parser("pipeline-runs", help="List recorded daily-pipeline runs, newest first (M9)")
+    p_pr.add_argument("--db", required=True, help="SQLite database file written by a previous `run-daily` run")
+    p_pr.add_argument("--latest", action="store_true", help="Show only the most recent run")
+    p_pr.add_argument("--limit", type=int, default=20, help="Runs to show (default: 20, max: 100)")
+    p_pr.add_argument("--json", action="store_true", help="Print runs as JSON instead of human-readable lines")
     p_sp = sub.add_parser("stream-produce", help="Publish events from a JSONL/JSON file to the file-log broker (M4)")
     p_sp.add_argument("--log-dir", required=True, help="Broker log directory (created if missing)")
     p_sp.add_argument("--events", required=True, help="Events file: JSON Lines or a JSON array of event objects")
@@ -45,7 +50,18 @@ def main(argv=None) -> int:
     p_sc.add_argument("--db", required=True, help="SQLite database file for the operational store")
     p_sc.add_argument("--group", required=True, help="Consumer group name (offsets are tracked per group)")
     p_sc.add_argument("--topic", default=None, help="Topic (default: pharmaflow.inventory.events.v1)")
+    p_sm = sub.add_parser("stream-metrics", help="Prometheus text for stream lag + DLQ size, read from the broker (M8)")
+    p_sm.add_argument("--log-dir", required=True, help="Broker log directory written by stream-produce")
+    p_sm.add_argument("--group", action="append", default=[], help="Consumer group to report lag for (repeatable; omit for DLQ only)")
+    p_sm.add_argument("--topic", default=None, help="Topic (default: pharmaflow.inventory.events.v1)")
     args = parser.parse_args(argv)
+    if args.cmd == "stream-metrics":
+        from .observability import render_streaming_prometheus, snapshot_streaming
+        from .streaming import DEFAULT_TOPIC, FileLogBroker
+        broker = FileLogBroker(args.log_dir)
+        snap = snapshot_streaming(broker, args.group, topic=args.topic or DEFAULT_TOPIC)
+        print(render_streaming_prometheus(snap), end="")
+        return 0
     if args.cmd == "stream-produce":
         from .streaming import DEFAULT_TOPIC, EventProducer, FileLogBroker, load_events_file
         if not Path(args.events).exists():
@@ -78,11 +94,44 @@ def main(argv=None) -> int:
         today = date.fromisoformat(args.today) if args.today else None
         print(render_analytics(analytics_for_db(args.db, today=today)), end="")
         return 0
+    if args.cmd == "pipeline-runs":
+        import json as _json
+        if not Path(args.db).exists():
+            print(f"ERROR: database not found: {args.db}"); return 2
+        store = SqliteStore(args.db)
+        try:
+            if args.latest:
+                latest = store.latest_pipeline_run()
+                runs = [latest] if latest is not None else []
+            else:
+                runs = store.list_pipeline_runs(limit=args.limit)
+        finally:
+            store.close()
+        if args.json:
+            print(_json.dumps([
+                {"run_id": r.run_id, "logical_date": r.logical_date.isoformat(),
+                 "recorded_at": r.recorded_at, "succeeded": r.succeeded,
+                 "failed_task": r.failed_task, "result": r.result_dict}
+                for r in runs
+            ], indent=2, default=str))
+            return 0
+        if not runs:
+            print("No pipeline runs recorded.")
+            return 0
+        for r in runs:
+            tasks = " ".join(
+                f"{o['name']}:{o['status']}({o['attempts']})"
+                for o in r.result_dict.get("outcomes", [])
+            )
+            print(f"#{r.run_id} logical_date={r.logical_date} recorded_at={r.recorded_at} "
+                  f"succeeded={r.succeeded} failed_task={r.failed_task} {tasks}")
+        return 0
     if args.cmd == "run-daily":
         from .orchestration import render_pipeline_result, run_daily
         logical = date.fromisoformat(args.date) if args.date else None
         result = run_daily(args.db, args.data_dir, logical_date=logical, retries=args.retries, today=logical)
         print(render_pipeline_result(result), end="")
+        print(f"Recorded as pipeline run #{result.run_id} (logical date {result.logical_date})")
         return 0 if result.succeeded else 1
     if args.cmd == "report":
         if not Path(args.db).exists():

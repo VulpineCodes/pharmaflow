@@ -111,14 +111,14 @@ def test_quarantine_and_audit_persist_and_are_queryable(tmp_path):
 def test_schema_creation_is_idempotent(tmp_path):
     db = tmp_path / "pharma.db"
     s = SqliteStore(db)
-    assert s.schema_version == 1
+    assert s.schema_version == 2
     s._init_schema()  # re-running schema creation must not fail or duplicate
     s._init_schema()
-    assert s.schema_version == 1
+    assert s.schema_version == 2
     s.close()
     # Opening the same file again runs schema creation again — still fine.
     with SqliteStore(db) as s2:
-        assert s2.schema_version == 1
+        assert s2.schema_version == 2
         ingest_file(INV, s2)
         assert len(s2.inventory) == 5
 

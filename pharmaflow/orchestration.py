@@ -18,6 +18,11 @@ Runner semantics (explicit, tested):
   (M2 file/row hashes) and the transform rebuilds its DuckDB models from
   the operational store, so re-running the same logical date after a
   mid-pipeline failure completes without duplicating inventory.
+* **run history is durable (M9)**: ``run_daily`` appends the completed
+  result (success or failure) to the ``pipeline_runs`` table in the
+  operational SQLite database, so the last run survives a restart and
+  the API can serve it (``GET /pipeline-runs/latest``) and expose it
+  as Prometheus gauges on ``/metrics``.
 """
 from __future__ import annotations
 
@@ -107,11 +112,54 @@ class TaskOutcome:
     result: dict | None = None
     error: str | None = None
 
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "attempts": self.attempts,
+            "result": self.result,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TaskOutcome":
+        return cls(
+            name=d["name"],
+            status=d["status"],
+            attempts=int(d.get("attempts", 0)),
+            result=d.get("result"),
+            error=d.get("error"),
+        )
+
 
 @dataclass
 class PipelineResult:
     logical_date: date
     outcomes: list[TaskOutcome] = field(default_factory=list)
+    # Storage id assigned by run_daily when the run is persisted (M9);
+    # None for a purely in-memory result (persist=False) or one that
+    # was rebuilt from a stored dict. Not part of the stored payload:
+    # the id/recorded_at live in the pipeline_runs row, not the run.
+    run_id: int | None = None
+
+    def to_dict(self) -> dict:
+        """JSON-safe payload for durable storage (M9).
+
+        Dates serialise as ISO strings; outcome ``result`` values are
+        left as-is here and JSON-encoded with ``default=str`` by the
+        store, so a non-JSON-native value cannot break recording.
+        """
+        return {
+            "logical_date": self.logical_date.isoformat(),
+            "outcomes": [o.to_dict() for o in self.outcomes],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PipelineResult":
+        return cls(
+            logical_date=date.fromisoformat(d["logical_date"]),
+            outcomes=[TaskOutcome.from_dict(o) for o in d.get("outcomes", [])],
+        )
 
     @property
     def succeeded(self) -> bool:
@@ -134,12 +182,23 @@ class PipelineResult:
 def run_daily(db_path: str | Path, data_dir: str | Path,
               logical_date: date | None = None, retries: int = 2,
               today: date | None = None,
-              transform_data_dir: str | Path | None = None) -> PipelineResult:
+              transform_data_dir: str | Path | None = None,
+              persist: bool = True) -> PipelineResult:
     """Execute ingest → transform → report in DAG order, with retries.
 
     ``transform_data_dir`` overrides the transform's raw source (tests use
     it to inject a deliberately bad seed); production callers leave it
     ``None`` so the transform reads the operational store.
+
+    Persistence (M9, ``persist=True``, the default): the completed
+    result — success *or* failure — is appended to the ``pipeline_runs``
+    table in the same SQLite database, and its row id is set on
+    ``result.run_id``. Every run is appended, including re-runs of the
+    same logical date; ingest idempotency is what prevents duplicate
+    inventory, not overwriting run history. A recording failure raises
+    rather than silently losing the run record. ``persist=False``
+    keeps the historical in-memory-only behaviour (no row, ``run_id``
+    stays ``None``).
     """
     logical_date = logical_date or date.today()
     duckdb_path = str(Path(db_path).with_suffix(".duckdb"))
@@ -171,6 +230,12 @@ def run_daily(db_path: str | Path, data_dir: str | Path,
             # Keep the traceback available to callers debugging locally.
             outcome.error = outcome.error or "unknown failure"
         result.outcomes.append(outcome)
+    if persist:
+        store = SqliteStore(db_path)
+        try:
+            result.run_id = store.record_pipeline_run(result.to_dict())
+        finally:
+            store.close()
     return result
 
 
