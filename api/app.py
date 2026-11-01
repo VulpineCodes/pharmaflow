@@ -31,6 +31,7 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 from pharmaflow import SqliteStore, build_report, generate_alerts, ingest_bytes
+from pharmaflow.metrics import durable_metrics
 from pharmaflow.reconciliation import reconcile
 
 
@@ -54,6 +55,13 @@ def create_app(db_path: str | Path | None = None,
     last stored run's pipeline gauges, labelled with its logical
     date. An app whose database has no recorded runs serves no
     pipeline gauges.
+
+    M10 durable counters: ``/metrics`` renders ingestion counters
+    derived from the store's persisted imports + audit trail
+    (``durable_metrics``), so a fresh process on the same database
+    serves the same numbers instead of restarting at zero. Each
+    distinct file is counted once, at its first import; a
+    duplicate-file re-import adds to ``files_already_imported`` only.
     """
     path = Path(db_path or os.environ.get("PHARMAFLOW_DB") or "pharmaflow.db")
     store = SqliteStore(path)
@@ -63,7 +71,7 @@ def create_app(db_path: str | Path | None = None,
         stream_groups = [g.strip() for g in env_groups.split(",") if g.strip()]
     app_state_stream = (Path(stream_dir), list(stream_groups)) if stream_dir else None
 
-    app = FastAPI(title="PharmaFlow API", version="0.4.0")
+    app = FastAPI(title="PharmaFlow API", version="0.5.0")
     app.state.store = store
     app.state.db_path = str(path)
 
@@ -194,7 +202,10 @@ def create_app(db_path: str | Path | None = None,
 
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics():
-        text = store.metrics.render_prometheus()
+        # M10: ingestion counters are derived from the persisted record,
+        # so they survive process restarts (the old per-process
+        # store.metrics reset to zero on every restart).
+        text = durable_metrics(store).render_prometheus()
         if app_state_stream is not None:
             log_dir, groups = app_state_stream
             if log_dir.exists():

@@ -6,6 +6,7 @@ from .ingestion import PharmaStore, ingest_file
 from .alerts import generate_alerts
 from .sqlite_store import SqliteStore
 from .data_quality import build_report, render_report
+from .metrics import durable_metrics
 
 def _open_store(db_path):
     """Durable SQLite store when --db is given, else in-memory (volatile)."""
@@ -165,8 +166,8 @@ def main(argv=None) -> int:
             alerts = generate_alerts(store.inventory, today=today)
             print(f"Alerts: {len(alerts)}")
             for a in alerts: print(f"  [{a.kind}] {a.message}")
-            print("Metrics (Prometheus text):")
-            print(store.metrics.render_prometheus(), end="")
+            print("Metrics (Prometheus text, durable — derived from the recorded imports):")
+            print(durable_metrics(store).render_prometheus(), end="")
             print(f"Audit entries: {len(store.audit.entries)}")
             for entry in store.audit.entries: print(f"  {entry.timestamp} {entry.action} {entry.details}")
             return 0

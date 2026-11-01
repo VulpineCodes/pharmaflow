@@ -1,6 +1,6 @@
 # PharmaFlow: Status
 
-_Last verified: 2026-10-28 (America/Chicago). All claims below were run locally._
+_Last verified: 2026-10-30 (America/Chicago). All claims below were run locally._
 
 ## Audit re-verification (2026-10-28)
 
@@ -47,9 +47,9 @@ alone.
   before M9, version 2 from M9).
   Ingestion runs against `StoreProtocol`; the in-memory `PharmaStore`
   remains for unit tests and now implements the same interface.
-- Tests: **76 passed** as of M9 (`python -m pytest -q` in the local
-  venv, Python 3.12, pytest 9.1.1). That is 67 through M8 plus 9 M9
-  pipeline-run persistence tests. See the M9 section below.
+- Tests: **82 passed** as of M10 (`python -m pytest -q` in the local
+  venv, Python 3.12, pytest 9.1.1). That is 76 through M9 plus 6 M10
+  durable-counter tests. See the M10 section below.
   Environment note: system pip is externally managed (PEP 668), so all
   M3 work ran in the gitignored `.venv/` (`python3 -m venv .venv`).
 - CLI (in-memory): `python -m pharmaflow ingest sample_data/inventory.csv sample_data/sales.csv sample_data/inventory_with_errors.csv --today 2026-10-22`
@@ -448,6 +448,65 @@ alone.
 - `PostgresStore` does not persist runs (its schema stays at version
   1; the path is code-only and unverified in any case).
 
+## M10: durable ingestion counters (2026-10-30)
+
+### What was built: EXECUTED
+
+- `pharmaflow/metrics.py`: `Metrics.from_imports(imports,
+  files_already_imported)` builds the six counters from recorded
+  import summaries, and `durable_metrics(store)` derives them at read
+  time from any store's `list_imports()` plus the count of
+  `import_skipped_duplicate_file` audit entries. No new table or
+  migration: the M2 imports table and audit table already held
+  everything. Each distinct file is counted once, at its first
+  import; a duplicate-file re-import adds to
+  `files_already_imported` only, never to `rows_in` again. The four
+  row counters plus `imports_total` are exactly the data-quality
+  report totals, by construction.
+- `GET /metrics` (API version 0.5.0) and the CLI `ingest` metrics
+  print now serve the durable counters instead of the per-process
+  `store.metrics`. The session counters are kept — ingestion still
+  increments them, and the foundation tests still assert them — but
+  nothing user-facing reads them anymore. The documented M5/M8
+  limitation ("a fresh API process starts counters at zero") is
+  closed by this milestone.
+- Docs: `docs/OBSERVABILITY.md` updated (table row, new M10 section,
+  revised limits).
+
+### Evidence: EXECUTED (`tests/test_m10.py`, 6 tests)
+
+- `from_imports` sums verified against hand-built import records
+  (15/10/4/1, imports_total 3, skips 2).
+- Durable counters equal the DQ report totals on the three sample
+  files (rows_in 15, valid 11, quarantined 3, duplicates_skipped 1,
+  imports_total 3).
+- Duplicate re-import: durable rows_in stays 5,
+  files_already_imported 1; session rows_in 10 (difference asserted
+  explicitly, not hidden).
+- Cross-restart: ingest into a `SqliteStore`, close, reopen a new
+  instance on the same file — session counters 0, durable counters
+  identical (12/8/3/1, imports 2, skips 1).
+- API: second app instance on the same DB serves byte-identical
+  `/metrics`; duplicate POST on the new process leaves rows_in 5,
+  raises files_already_imported to 1.
+- CLI: two separate processes ingesting the same file into the same
+  DB print rows_in_total 5 both times, files_already_imported 0 then 1.
+- Live check beyond the tests: real uvicorn server on port 8767,
+  `POST /imports` (rows_valid 5), server killed and restarted on the
+  same DB — `/metrics` still rows_in 5 / imports_total 1, inventory
+  intact (MED-001 120); duplicate POST on the restarted server
+  returns already_imported=true and files_already_imported 1.
+- **Tests: 82 passed** (76 previous, all still green, plus 6 M10).
+
+### Still NOT done (stated plainly)
+
+- The durable counters describe recorded imports only. Streaming
+  events consumed into inventory (M4) do not change them, and neither
+  do pipeline runs; those have their own gauges.
+- The Postgres store does not persist imports (code-only path), so
+  durable counters are a SQLite/in-memory-store feature until the
+  Postgres path is executed against a real server.
+
 ## Acceptance check (foundation slice)
 
 - [x] Valid import persists inventory by SKU
@@ -528,9 +587,14 @@ alone.
   callables it wires were run, via the local runner. Airflow retry/backfill
   *declarations* in the DAG mirror the runner's tested semantics.
   Airflow-executed runs are not recorded in pipeline-run history.
-- Metrics counters are per-process (in-memory) even with the SQLite store;
-  durable counters are not part of M2/M3. Imports, quarantine, and audit are the
-  persisted record, and the DQ report is derived from them.
+- Metrics counters are durable since M10: `/metrics` and the CLI
+  ingest print derive them from the recorded imports + audit trail,
+  so a fresh process on the same database serves the same numbers.
+  The per-process session counters still exist in-memory (ingestion
+  increments them; foundation tests assert them) but nothing
+  user-facing reads them. Imports, quarantine, and audit are the
+  persisted record, and the DQ report totals equal the durable
+  counters by construction.
 - Analytics category is *derived* from product names (no source category
   column); sales velocity uses the observed sales window (2 days in the
   sample data). Both definitions are documented in `analytics.py` and
@@ -545,10 +609,10 @@ alone.
   run, 0.868s in the 2026-10-28 reproduction run, vs the
   M6 row-by-row loader's 61.610s, kept in RESULTS.md as "before").
   No figure here says anything about production scale.
-- API metrics counters are still per-process (the serving process's
-  `SqliteStore.metrics`); a fresh API process starts counters at zero
-  even though imports/audit persist. The DQ endpoint (derived from
-  persisted imports) is the durable view.
+- API metrics counters are durable since M10 (derived from the
+  store's recorded imports + audit); a fresh API process serves the
+  same counters. The DQ endpoint (derived from persisted imports)
+  agrees with them by construction.
 - Grafana/Prometheus dashboards are still compose declarations only
   (no Docker here); observability verification is the `/metrics`
   endpoint plus DQ report, not a dashboard.
@@ -617,6 +681,15 @@ alone.
   `pipeline-runs` CLI, and logical-date-labelled pipeline gauges on
   `/metrics` serve the stored history; 76 tests green. Airflow-executed
   runs are not recorded; the Postgres store does not persist runs.
+- **M10: Durable counters (done, 2026-10-30):** ingestion counters
+  derived at read time from recorded imports + audit trail
+  (`durable_metrics`); `GET /metrics` (API 0.5.0) and the CLI ingest
+  print serve them, so a fresh process on the same database serves
+  the same numbers (each file counted once; duplicate re-imports
+  raise `files_already_imported` only). Verified by 6 new tests plus
+  live CLI (two processes) and uvicorn restart checks; 82 tests green.
+  Streaming-consumed events do not change these counters; Postgres
+  path still code-only.
 
 ## Next actionable task
 
@@ -625,9 +698,11 @@ apply `db/migrations/001_initial_schema.sql` and run the M2 persistence
 scenarios against `PostgresStore`; (2) real Redpanda: the
 `docs/STREAMING_RUNBOOK.md` checklist. Needs no new infrastructure:
 (a) push to GitHub so the CI workflow (incl. the dbt job) actually
-runs. The M8 commit (8de4492) and M9 commit (6757f9f) are local only;
-the workflow file was verified absent from the public branch on
-2026-10-28.
+runs — the workflow file is still absent from the public branch
+(verified 2026-10-28; the GitHub App lacks workflows permission, so
+it needs a permission grant or a web-UI upload by Franklin). M8, M9,
+and the audit are already on GitHub (remote head 76e839b0, verified
+2026-10-29); M10 is the next push.
 (b) recording runs executed under Airflow (DAG wires task callables,
 not `run_daily`) is future work, not claimed.
 (Done in M9: durable pipeline-run history. Done in M8:

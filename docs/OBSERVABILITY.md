@@ -1,10 +1,10 @@
-# PharmaFlow observability (M8)
+# PharmaFlow observability (M8, M9, M10)
 
 ## What is exposed, and where it comes from
 
 | Metric | Meaning | Source of truth |
 |---|---|---|
-| `pharmaflow_rows_in_total` etc. | Ingestion counters (M1/M2) | In-memory `Metrics` on the store; per-process, not durable |
+| `pharmaflow_rows_in_total` etc. | Ingestion counters (M1/M2, durable since M10) | Derived at read time from recorded imports + audit trail (`durable_metrics`); survives restarts |
 | `pharmaflow_stream_lag_records{group,topic}` | Unconsumed records for a consumer group | Broker: partition end offsets minus committed offsets |
 | `pharmaflow_stream_partition_lag_records{group,topic,partition}` | Same, per partition (find a stuck partition) | Broker, same calculation |
 | `pharmaflow_stream_dlq_records{topic}` | Records dead-lettered to the DLQ topic | DLQ topic size in the broker |
@@ -64,11 +64,28 @@ ingestion counters. No empty streaming gauges appear, and a GET never
 creates broker files (gauges appear only when the log directory
 already exists).
 
+## Ingestion counters are durable (M10)
+
+The four row counters plus `imports_total` are the data-quality
+report totals, computed from the recorded imports at read time, so
+`/metrics` and `python -m pharmaflow ingest` print the same numbers
+a fresh process would. Each distinct file is counted once, at its
+first import; a duplicate-file re-import adds to
+`files_already_imported` only (counted from the audit trail), never to
+`rows_in` again. The in-memory session counter still counts every
+ingest call, including re-imports — the two views differ by design,
+and the difference is the honest statement of what a re-import did.
+No new table or migration was needed: the imports table (M2) and the
+audit table already held everything. Verified by
+`tests/test_m10.py`: cross-restart SQLite reopen, a second FastAPI
+app instance on the same DB file, and two separate CLI processes.
+
 ## Honest limits
 
-- Ingestion counters reset when the serving process restarts; the
-  durable view of imports is the data-quality report (`/data-quality`),
-  derived from persisted imports, not from counters.
+- Ingestion counters are durable from M10 onward (see above); the
+  per-process session counters still exist in-memory and are what the
+  foundation tests assert. The durable view is the one `/metrics`
+  and the CLI print serve.
 - Pipeline gauges on `/metrics` describe the last *stored* run; runs
   executed under Airflow (task callables, not `run_daily`) are not
   recorded, and the Postgres store does not persist runs.
