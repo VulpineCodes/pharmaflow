@@ -62,6 +62,35 @@ def create_app(db_path: str | Path | None = None,
     serves the same numbers instead of restarting at zero. Each
     distinct file is counted once, at its first import; a
     duplicate-file re-import adds to ``files_already_imported`` only.
+
+    M11 stream consumption: ``GET /stream-consumption`` (newest first,
+    optional ``?group=``) and ``GET /stream-consumption/latest``
+    serve the durable consume-run history recorded by
+    ``stream-consume``; ``/metrics`` additionally renders per-group
+    summed consumption counters. An app whose database has no recorded
+    consume runs serves no stream-consumption gauges.
+
+    M12 dead letters: ``GET /dead-letters`` (newest first, optional
+    ``?group=``) and ``GET /dead-letters/latest`` serve the durable
+    dead-letter history recorded by ``stream-consume`` — one row per
+    poison event a completed run dead-lettered, with its errors and
+    source coordinates; ``/metrics`` additionally renders per-group
+    dead-letter totals. An app whose database has no recorded dead
+    letters serves no dead-letter gauge.
+
+    M13 dead-letter replays: ``POST /dead-letters/{record_id}/replay``
+    re-publishes a recorded dead letter with caller-supplied field
+    corrections (``{"corrections": {...}}``; empty means re-publish
+    the original payload unchanged) after validating it through the
+    same ``parse_event`` rules the consumer applies; the corrected
+    event keeps the original event id, so the consumer's dedupe
+    makes a double replay a no-op. ``GET /dead-letter-replays``
+    (newest first, optional ``?dead_letter_id=`` / ``?group=``) and
+    ``GET /dead-letter-replays/latest`` serve the durable replay
+    history; ``/metrics`` additionally renders per-group replay
+    totals. Replay requires a broker log directory configured (the
+    same ``stream_log_dir`` argument / ``PHARMAFLOW_STREAM_LOG_DIR``
+    env var the streaming gauges use) and returns 503 without one.
     """
     path = Path(db_path or os.environ.get("PHARMAFLOW_DB") or "pharmaflow.db")
     store = SqliteStore(path)
@@ -71,7 +100,7 @@ def create_app(db_path: str | Path | None = None,
         stream_groups = [g.strip() for g in env_groups.split(",") if g.strip()]
     app_state_stream = (Path(stream_dir), list(stream_groups)) if stream_dir else None
 
-    app = FastAPI(title="PharmaFlow API", version="0.5.0")
+    app = FastAPI(title="PharmaFlow API", version="0.8.0")
     app.state.store = store
     app.state.db_path = str(path)
 
@@ -200,6 +229,172 @@ def create_app(db_path: str | Path | None = None,
             raise HTTPException(status_code=404, detail="no pipeline runs recorded")
         return _run_response(record)
 
+    @app.get("/stream-consumption")
+    def stream_consumption(group: str | None = Query(default=None),
+                           limit: int = Query(default=20, ge=1, le=100)):
+        """Recorded stream-consume runs, newest first (M11).
+
+        Every *completed* ``stream-consume`` execution is appended —
+        including no-op catch-ups (read=0) and re-runs after a crash
+        (whose duplicates column shows the redelivery). A run
+        interrupted mid-consume is never recorded.
+        """
+        return [
+            {
+                "run_id": r.run_id, "group": r.group, "topic": r.topic,
+                "records_read": r.records_read, "applied": r.applied,
+                "duplicates": r.duplicates, "dlq": r.dlq,
+                "lag_before": r.lag_before, "lag_after": r.lag_after,
+                "recorded_at": r.recorded_at,
+            }
+            for r in store.list_stream_consumption(group=group, limit=limit)
+        ]
+
+    @app.get("/stream-consumption/latest")
+    def stream_consumption_latest(group: str | None = Query(default=None)):
+        """The most recently recorded consume run, or 404 when none exists."""
+        from fastapi import HTTPException
+
+        record = store.latest_stream_consumption(group=group)
+        if record is None:
+            raise HTTPException(status_code=404,
+                                detail="no stream consumption runs recorded")
+        return {
+            "run_id": record.run_id, "group": record.group, "topic": record.topic,
+            "records_read": record.records_read, "applied": record.applied,
+            "duplicates": record.duplicates, "dlq": record.dlq,
+            "lag_before": record.lag_before, "lag_after": record.lag_after,
+            "recorded_at": record.recorded_at,
+        }
+
+    @app.get("/dead-letters")
+    def dead_letters(group: str | None = Query(default=None),
+                     limit: int = Query(default=20, ge=1, le=100)):
+        """Recorded dead letters, newest first (M12).
+
+        One row per poison event a *completed* ``stream-consume`` run
+        dead-lettered: the consumer group, the event id (possibly
+        empty for a malformed record), the validation errors, and the
+        source topic/partition/offset where the poison record sits in
+        the broker log. A run interrupted mid-consume records nothing.
+        """
+        return [
+            {
+                "record_id": r.record_id, "group": r.group,
+                "event_id": r.event_id, "errors": r.errors,
+                "topic": r.topic, "partition": r.partition,
+                "offset": r.offset, "recorded_at": r.recorded_at,
+            }
+            for r in store.list_dead_letters(group=group, limit=limit)
+        ]
+
+    @app.get("/dead-letters/latest")
+    def dead_letters_latest(group: str | None = Query(default=None)):
+        """The most recently recorded dead letter, or 404 when none exists."""
+        from fastapi import HTTPException
+
+        record = store.latest_dead_letter(group=group)
+        if record is None:
+            raise HTTPException(status_code=404,
+                                detail="no dead letters recorded")
+        return {
+            "record_id": record.record_id, "group": record.group,
+            "event_id": record.event_id, "errors": record.errors,
+            "topic": record.topic, "partition": record.partition,
+            "offset": record.offset, "recorded_at": record.recorded_at,
+        }
+
+    def _replay_response(replay):
+        """Serialise a DeadLetterReplay for the replay endpoints."""
+        return {
+            "replay_id": replay.replay_id,
+            "dead_letter_id": replay.dead_letter_id,
+            "group": replay.group, "event_id": replay.event_id,
+            "topic": replay.topic, "partition": replay.partition,
+            "offset": replay.offset,
+            "corrected_event": replay.corrected_event,
+            "replayed_at": replay.replayed_at,
+        }
+
+    @app.post("/dead-letters/{record_id}/replay", status_code=201)
+    def dead_letter_replay(record_id: int, payload: dict | None = None):
+        """Re-publish a recorded dead letter with corrections (M13).
+
+        Body: ``{"corrections": {...}}`` — field overrides applied on
+        top of the original payload (empty/omitted re-publishes the
+        original unchanged). The corrected event is validated through
+        the same ``parse_event`` rules the consumer applies and keeps
+        the original event id, so a double replay is deduplicated by
+        the consumer. Returns the recorded replay, including the
+        broker coordinates of the re-published record. 404 for an
+        unknown dead-letter id, 422 when the corrected payload still
+        fails validation, 400 for a replay that cannot proceed
+        (e.g. a correction changing the event id, or the original
+        record missing from the broker log), 503 when no broker log
+        directory is configured (``PHARMAFLOW_STREAM_LOG_DIR``).
+        """
+        from fastapi import HTTPException
+
+        from pharmaflow.streaming import EventValidationError, replay_dead_letter
+
+        if app_state_stream is None:
+            raise HTTPException(
+                status_code=503,
+                detail="dead-letter replay requires a broker log directory "
+                       "(set PHARMAFLOW_STREAM_LOG_DIR)")
+        log_dir, _groups = app_state_stream
+        body = payload or {}
+        corrections = body.get("corrections")
+        if corrections is not None and not isinstance(corrections, dict):
+            raise HTTPException(status_code=422,
+                                detail="corrections must be a JSON object")
+        try:
+            replay = replay_dead_letter(
+                log_dir, path, record_id,
+                corrections=corrections,
+                group=body.get("group"),
+            )
+        except EventValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors) from exc
+        except ValueError as exc:
+            msg = str(exc)
+            if msg.startswith("no dead letter recorded"):
+                raise HTTPException(status_code=404, detail=msg) from exc
+            raise HTTPException(status_code=400, detail=msg) from exc
+        return _replay_response(replay)
+
+    @app.get("/dead-letter-replays")
+    def dead_letter_replays(dead_letter_id: int | None = Query(default=None),
+                            group: str | None = Query(default=None),
+                            limit: int = Query(default=20, ge=1, le=100)):
+        """Recorded dead-letter replays, newest first (M13).
+
+        One row per corrected re-publish: which dead letter it fixed,
+        the group, the (unchanged) event id, the corrected payload as
+        published, and the broker coordinates of the re-published
+        record. Replaying the same dead letter twice appends two
+        rows; the consumer's event-id dedupe is what makes the
+        second copy a no-op.
+        """
+        return [
+            _replay_response(r)
+            for r in store.list_dead_letter_replays(
+                dead_letter_id=dead_letter_id, group=group, limit=limit)
+        ]
+
+    @app.get("/dead-letter-replays/latest")
+    def dead_letter_replays_latest(dead_letter_id: int | None = Query(default=None),
+                                   group: str | None = Query(default=None)):
+        """The most recently recorded replay, or 404 when none exists."""
+        from fastapi import HTTPException
+
+        record = store.latest_dead_letter_replay(
+            dead_letter_id=dead_letter_id, group=group)
+        if record is None:
+            raise HTTPException(status_code=404,
+                                detail="no dead-letter replays recorded")
+        return _replay_response(record)
+
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics():
         # M10: ingestion counters are derived from the persisted record,
@@ -230,6 +425,42 @@ def create_app(db_path: str | Path | None = None,
                 PipelineResult.from_dict(latest.result_dict),
                 logical_date=latest.logical_date,
                 runs_total=store.count_pipeline_runs(),
+            )
+        # M11: stream-consumption gauges sum over recorded, completed
+        # consume runs, per group — so they survive process restarts.
+        # No recorded runs yet -> no stream-consumption gauges (same
+        # as the M9 pipeline gauges above). Live lag/DLQ still come
+        # from the broker snapshot rendered above.
+        if store.count_stream_consumption() > 0:
+            from pharmaflow.observability import (
+                render_stream_consumption_prometheus,
+            )
+
+            text += render_stream_consumption_prometheus(
+                store.stream_consumption_totals_by_group()
+            )
+        # M12: dead-letter totals count poison events dead-lettered by
+        # completed, recorded consume runs, per group. No recorded dead
+        # letters yet -> no dead-letter gauge. The live DLQ size still
+        # comes from the broker snapshot rendered above.
+        if store.count_dead_letters() > 0:
+            from pharmaflow.observability import render_dead_letters_prometheus
+
+            text += render_dead_letters_prometheus(
+                store.dead_letter_totals_by_group()
+            )
+        # M13: replay totals count corrected re-publishes of recorded
+        # dead letters, per group. No recorded replays yet -> no
+        # replay gauge. This gauge says the event was re-published,
+        # not that it was applied — application is decided by the
+        # next consume run and shows up in the consumption gauges.
+        if store.count_dead_letter_replays() > 0:
+            from pharmaflow.observability import (
+                render_dead_letter_replays_prometheus,
+            )
+
+            text += render_dead_letter_replays_prometheus(
+                store.dead_letter_replay_totals_by_group()
             )
         return text
 

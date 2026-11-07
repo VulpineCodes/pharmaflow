@@ -577,6 +577,37 @@ class SimulatedCrashError(RuntimeError):
 
 
 @dataclass
+class DeadLetter:
+    """One poison event dead-lettered by a completed consume run (M12).
+
+    The same payload the broker's DLQ topic carries (errors plus
+    source coordinates), plus the consumer group that dead-lettered
+    it — so a poison event is queryable from the operational store
+    without reading the broker log. ``event_id`` may be empty when
+    the raw record carried none (e.g. a malformed event with no id
+    at all); the source topic/partition/offset still identifies it.
+    """
+
+    group: str
+    event_id: str
+    errors: list[str]
+    source_topic: str
+    source_partition: int
+    source_offset: int
+    dead_lettered_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "group": self.group, "event_id": self.event_id,
+            "errors": list(self.errors),
+            "source_topic": self.source_topic,
+            "source_partition": self.source_partition,
+            "source_offset": self.source_offset,
+            "dead_lettered_at": self.dead_lettered_at,
+        }
+
+
+@dataclass
 class ConsumeResult:
     group: str
     topic: str
@@ -586,6 +617,16 @@ class ConsumeResult:
     dlq: int = 0  # poison events dead-lettered (== "skipped" in CLI output)
     lag_before: int = 0
     lag_after: int = 0
+    # M11: set by consume_once when the completed run was recorded in
+    # the store's durable history; None when not recorded (in-memory
+    # store, record=False, or a run that never completed).
+    record_id: int | None = None
+    # M12: the poison events this run dead-lettered, in the order they
+    # were seen. Populated during the run whether or not the run is
+    # recorded; ``dead_letter_ids`` holds the store row ids once
+    # consume_once has persisted them (empty when not recorded).
+    dead_letters: list[DeadLetter] = field(default_factory=list)
+    dead_letter_ids: list[int] = field(default_factory=list)
 
     @property
     def skipped(self) -> int:
@@ -725,7 +766,16 @@ class StreamingConsumer:
         self.dlq_topic = dlq_topic
         _ensure_dedupe_table(store)
 
-    def _dead_letter(self, record: BrokerRecord, errors: list[str]) -> None:
+    def _dead_letter(self, record: BrokerRecord, errors: list[str]) -> DeadLetter:
+        """Publish the poison record to the DLQ topic and describe it.
+
+        Returns the :class:`DeadLetter` so the caller can collect it on
+        the run result (M12: durable history). The broker write happens
+        here, during the run; the store write happens only later, in
+        ``consume_once``, and only for runs that complete — a run
+        interrupted mid-consume leaves its dead letters in the broker
+        DLQ topic only, never in the store history.
+        """
         dlq_value = {
             "original_value": record.value,
             "errors": errors,
@@ -735,6 +785,15 @@ class StreamingConsumer:
             "dead_lettered_at": _now(),
         }
         self.broker.produce(self.dlq_topic, record.key, dlq_value)
+        return DeadLetter(
+            group=self.group,
+            event_id=str(record.value.get("event_id") or ""),
+            errors=list(errors),
+            source_topic=record.topic,
+            source_partition=record.partition,
+            source_offset=record.offset,
+            dead_lettered_at=dlq_value["dead_lettered_at"],
+        )
 
     def consume_until_caught_up(self, *, crash_after_applies: int | None = None,
                                 commit: bool = True) -> ConsumeResult:
@@ -759,7 +818,7 @@ class StreamingConsumer:
                 try:
                     event = parse_event(record.value)
                 except EventValidationError as exc:
-                    self._dead_letter(record, exc.errors)
+                    result.dead_letters.append(self._dead_letter(record, exc.errors))
                     result.dlq += 1
                     new_offsets[partition] = record.offset + 1
                     continue
@@ -770,7 +829,7 @@ class StreamingConsumer:
                 try:
                     _apply_event(self.store, event)
                 except EventValidationError as exc:
-                    self._dead_letter(record, exc.errors)
+                    result.dead_letters.append(self._dead_letter(record, exc.errors))
                     result.dlq += 1
                     new_offsets[partition] = record.offset + 1
                     continue
@@ -791,13 +850,174 @@ class StreamingConsumer:
 
 
 def consume_once(log_dir: str | Path, db_path: str | Path, group: str,
-                 topic: str = DEFAULT_TOPIC) -> ConsumeResult:
-    """CLI helper: one consume-until-caught-up run against a SQLite DB."""
+                 topic: str = DEFAULT_TOPIC, record: bool = True) -> ConsumeResult:
+    """CLI helper: one consume-until-caught-up run against a SQLite DB.
+
+    M11: when the run *completes* and the store supports durable
+    consumption history (``SqliteStore``), the outcome is appended to
+    ``stream_consumption_runs`` and the run id is set on
+    ``result.record_id``. A run that raises (e.g. the crash-simulation
+    hook) records nothing — its partial application is visible in the
+    inventory/dedupe state, not in the history. ``record=False`` keeps
+    the old consume-only behaviour; stores without
+    ``record_stream_consumption`` (the in-memory store) are left alone.
+
+    M12: the same completion rule applies to the run's dead letters.
+    Each poison event the completed run dead-lettered is appended to
+    the ``dead_letters`` table (errors plus source coordinates) and
+    its row id is collected on ``result.dead_letter_ids``. A poison
+    event re-read after a crash is recorded once per completed run
+    that dead-lettered it — the same per-run semantics as the
+    duplicates column. The broker DLQ topic still receives the record
+    during the run regardless of recording (M4 behaviour, unchanged).
+    """
     from .sqlite_store import SqliteStore
     broker = FileLogBroker(log_dir)
     store = SqliteStore(db_path)
     try:
         consumer = StreamingConsumer(broker, store, group=group, topic=topic)
-        return consumer.consume_until_caught_up()
+        result = consumer.consume_until_caught_up()
+        if record and hasattr(store, "record_stream_consumption"):
+            result.record_id = store.record_stream_consumption(result)
+        if record and hasattr(store, "record_dead_letter"):
+            result.dead_letter_ids = [
+                store.record_dead_letter(dl) for dl in result.dead_letters
+            ]
+        return result
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Dead-letter replay (M13)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DeadLetterReplay:
+    """One corrected re-publish of a recorded dead letter (M13).
+
+    A replay does NOT apply the event directly: it publishes the
+    corrected payload back to the original topic, with the original
+    event id, so the normal consumer path — validation, dedupe,
+    offsets, and the next consume run's history — is the arbiter of
+    what happens next. ``replay_id`` is the store row id once the
+    replay has been recorded (``None`` before recording);
+    ``partition``/``offset`` are the coordinates of the re-published
+    record in the original topic.
+    """
+
+    dead_letter_id: int
+    group: str
+    event_id: str
+    topic: str
+    partition: int
+    offset: int
+    corrected_event: dict[str, Any]
+    replay_id: int | None = None
+    replayed_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "replay_id": self.replay_id,
+            "dead_letter_id": self.dead_letter_id,
+            "group": self.group,
+            "event_id": self.event_id,
+            "topic": self.topic,
+            "partition": self.partition,
+            "offset": self.offset,
+            "corrected_event": dict(self.corrected_event),
+            "replayed_at": self.replayed_at,
+        }
+
+
+def replay_dead_letter(log_dir: str | Path, db_path: str | Path,
+                       record_id: int,
+                       corrections: dict[str, Any] | None = None,
+                       group: str | None = None) -> DeadLetterReplay:
+    """Re-publish a recorded dead letter with corrections (M13).
+
+    ``record_id`` is the row id in the ``dead_letters`` table (see
+    ``dead-letters`` CLI / ``GET /dead-letters``). The original
+    record is read back from the broker at the dead letter's source
+    coordinates; ``corrections`` (field overrides, top level only)
+    are applied on top of it, and the result is validated through
+    the same :func:`parse_event` rules the consumer applies.
+
+    The event id is immutable: a correction that changes it is
+    rejected, because dedupe is keyed on it — a replayed event must
+    be recognised as the *same* event if it is replayed twice. The
+    one exception is a dead letter whose original record carried no
+    event id at all (``event_id`` empty): then the corrections must
+    supply one, since a publishable event needs an id.
+
+    ``corrections`` may be empty or omitted to re-publish the
+    original payload unchanged — legitimate when the poison was a
+    state failure at apply time (e.g. a sale for a SKU that did not
+    exist yet) rather than a malformed payload. A payload that still
+    fails :func:`parse_event` raises :class:`EventValidationError`
+    and records nothing; the dead letter stays replayable.
+
+    The corrected event is published with
+    :class:`EventProducer.publish` (validated publish path) and the
+    replay is appended to the store's ``dead_letter_replays`` table;
+    the replay id is set on the returned object. A recording
+    failure raises rather than silently losing the record. The
+    *outcome* of the replay (applied / duplicate / dead-lettered
+    again) is decided by the next ``stream-consume`` run for the
+    group and shows up in its consumption history — replaying the
+    same dead letter twice is safe: the second copy is deduplicated
+    by event id at consume time.
+    """
+    from .sqlite_store import SqliteStore
+    if corrections is not None and not isinstance(corrections, dict):
+        raise ValueError("corrections must be a JSON object (dict) or omitted")
+    broker = FileLogBroker(log_dir)
+    store = SqliteStore(db_path)
+    try:
+        letter = store.get_dead_letter(record_id)
+        if letter is None:
+            raise ValueError(f"no dead letter recorded with id {record_id}")
+        records = broker.read(letter.topic, letter.partition,
+                              letter.offset, max_records=1)
+        if not records:
+            raise ValueError(
+                f"original record for dead letter #{record_id} is not in "
+                f"the broker log ({letter.topic} partition {letter.partition} "
+                f"offset {letter.offset}); check --log-dir")
+        original = records[0].value
+        if letter.event_id and str(original.get("event_id") or "") != letter.event_id:
+            raise ValueError(
+                f"broker record at dead letter #{record_id}'s coordinates "
+                f"carries event_id {str(original.get('event_id') or '')!r}, "
+                f"not the recorded {letter.event_id!r}; refusing to replay")
+        base = dict(original) if isinstance(original, dict) else {}
+        corrected = dict(base)
+        corrected.update(corrections or {})
+        new_event_id = str(corrected.get("event_id") or "").strip()
+        if letter.event_id:
+            if new_event_id != letter.event_id:
+                raise ValueError(
+                    "corrections must not change event_id "
+                    f"({letter.event_id!r} -> {new_event_id!r}); the event id "
+                    "is the dedupe key")
+        elif not new_event_id:
+            raise EventValidationError(
+                ["event_id is required (the original record carried none; "
+                 "supply it in the corrections)"])
+        event = parse_event(corrected)
+        replay_group = group or letter.group
+        partition, offset = EventProducer(broker, topic=letter.topic).publish(event)
+        replay = DeadLetterReplay(
+            dead_letter_id=letter.record_id,
+            group=replay_group,
+            event_id=event.event_id,
+            topic=letter.topic,
+            partition=partition,
+            offset=offset,
+            corrected_event=event.to_dict(),
+            replayed_at=_now(),
+        )
+        replay.replay_id = store.record_dead_letter_replay(replay)
+        return replay
     finally:
         store.close()

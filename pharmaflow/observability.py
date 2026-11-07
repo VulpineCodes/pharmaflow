@@ -14,6 +14,25 @@ in production without adding a new dependency or a new store:
   *stored* (``pipeline_runs`` table), so ``/metrics`` renders the
   last stored run — labelled with its logical date — even after the
   serving process restarts.
+* **stream consumption history** — summed counters over completed,
+  recorded consume runs (M11, ``stream_consumption_runs`` table), so
+  what a group has consumed so far survives restarts. Live lag and
+  DLQ size still come from the broker snapshot above; the two views
+  answer different questions.
+* **dead-letter history** — counts of poison events dead-lettered by
+  completed, recorded consume runs (M12, ``dead_letters`` table), so
+  an operator can see how many poison events each group has seen
+  without reading the broker log. The per-event detail (errors plus
+  source coordinates) lives in the same table and is served by the
+  API; the gauge here is only the per-group total.
+* **dead-letter replays** — counts of corrected re-publishes of
+  recorded dead letters (M13, ``dead_letter_replays`` table), so an
+  operator can see how many poison events each group has had fixed
+  and re-driven. The replay record itself (which dead letter, the
+  corrected payload, the broker coordinates of the re-published
+  record) is served by the API; the gauge here is only the
+  per-group total. Whether a replay was *applied* is answered by
+  the next consume run's history (M11), not by this gauge.
 
 What this is NOT: a Prometheus server, a Grafana dashboard, or an
 alert rule. The ``/metrics`` endpoint (M5) serves the ingestion
@@ -127,6 +146,111 @@ def render_streaming_prometheus(snapshot: StreamingSnapshot) -> str:
     lines.append(
         f"pharmaflow_stream_dlq_records{{{_labels(topic=snapshot.dlq_topic)}}} {snapshot.dlq_records}"
     )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Stream consumption history (M11)
+# ---------------------------------------------------------------------------
+
+def render_stream_consumption_prometheus(totals_by_group: dict[str, dict[str, int]]) -> str:
+    """Render recorded consume-run totals as Prometheus gauges.
+
+    ``totals_by_group`` maps a consumer group to its summed counters
+    (``records_read``/``applied``/``duplicates``/``dlq``/``runs``), as
+    returned by ``SqliteStore.stream_consumption_totals`` per group.
+    These are sums over *completed, recorded* runs only — the durable
+    history, not live broker state. Live lag and DLQ size still come
+    from the broker snapshot (M8); the two views answer different
+    questions ("what has this group consumed so far?" vs "what is
+    waiting right now?"). An empty mapping renders nothing, so an app
+    with no recorded runs serves no stream-consumption gauges.
+    """
+    if not totals_by_group:
+        return ""
+    lines: list[str] = []
+    lines.append("# HELP pharmaflow_stream_consumption_runs_total Completed consume runs recorded for a consumer group.")
+    lines.append("# TYPE pharmaflow_stream_consumption_runs_total gauge")
+    for group in sorted(totals_by_group):
+        totals = totals_by_group[group]
+        lines.append(
+            f"pharmaflow_stream_consumption_runs_total{{{_labels(group=group)}}} {totals['runs']}"
+        )
+    for metric, key, help_text in [
+        ("pharmaflow_stream_consumed_read_total", "records_read",
+         "Records read by completed consume runs for a consumer group."),
+        ("pharmaflow_stream_consumed_applied_total", "applied",
+         "Events applied by completed consume runs for a consumer group."),
+        ("pharmaflow_stream_consumed_duplicates_total", "duplicates",
+         "Redelivered events recognised as duplicates by completed consume runs."),
+        ("pharmaflow_stream_consumed_dlq_total", "dlq",
+         "Poison events dead-lettered by completed consume runs."),
+    ]:
+        lines.append(f"# HELP {metric} {help_text}")
+        lines.append(f"# TYPE {metric} gauge")
+        for group in sorted(totals_by_group):
+            lines.append(
+                f"{metric}{{{_labels(group=group)}}} {totals_by_group[group][key]}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Dead-letter history (M12)
+# ---------------------------------------------------------------------------
+
+def render_dead_letters_prometheus(totals_by_group: dict[str, int]) -> str:
+    """Render recorded dead letters as a Prometheus gauge.
+
+    ``totals_by_group`` maps a consumer group to its recorded dead
+    letters, as returned by
+    ``SqliteStore.dead_letter_totals_by_group``. These are counts over
+    the durable history — poison events dead-lettered by *completed,
+    recorded* consume runs — not live broker state. The live DLQ size
+    still comes from the broker snapshot (M8); the two views answer
+    different questions ("which poison events have we seen, and why?"
+    vs "how many records are waiting in the DLQ right now?"). An
+    empty mapping renders nothing, so an app with no recorded dead
+    letters serves no dead-letter gauge.
+    """
+    if not totals_by_group:
+        return ""
+    lines: list[str] = []
+    lines.append("# HELP pharmaflow_dead_letters_total Poison events dead-lettered by completed consume runs for a consumer group.")
+    lines.append("# TYPE pharmaflow_dead_letters_total gauge")
+    for group in sorted(totals_by_group):
+        lines.append(
+            f"pharmaflow_dead_letters_total{{{_labels(group=group)}}} {totals_by_group[group]}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Dead-letter replays (M13)
+# ---------------------------------------------------------------------------
+
+def render_dead_letter_replays_prometheus(totals_by_group: dict[str, int]) -> str:
+    """Render recorded dead-letter replays as a Prometheus gauge.
+
+    ``totals_by_group`` maps a consumer group to its recorded
+    replays, as returned by
+    ``SqliteStore.dead_letter_replay_totals_by_group``. These are
+    counts over the durable history — corrected re-publishes of
+    recorded dead letters — not live broker state, and not a claim
+    that the replayed events were applied: application is decided
+    by the next consume run and shows up in the consumption
+    history (M11). An empty mapping renders nothing, so an app with
+    no recorded replays serves no replay gauge.
+    """
+    if not totals_by_group:
+        return ""
+    lines: list[str] = []
+    lines.append("# HELP pharmaflow_dead_letter_replays_total Corrected re-publishes of recorded dead letters for a consumer group.")
+    lines.append("# TYPE pharmaflow_dead_letter_replays_total gauge")
+    for group in sorted(totals_by_group):
+        lines.append(
+            f"pharmaflow_dead_letter_replays_total{{{_labels(group=group)}}} {totals_by_group[group]}"
+        )
     return "\n".join(lines) + "\n"
 
 

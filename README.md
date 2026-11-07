@@ -65,11 +65,11 @@ The design is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 | Component | Status | Evidence |
 |---|---|---|
-| CSV ingestion, validation, quarantine, reconciliation, alerts | Verified locally | 76 pytest tests pass; CLI runs above |
+| CSV ingestion, validation, quarantine, reconciliation, alerts | Verified locally | 101 pytest tests pass; CLI runs above |
 | SQLite persistence and idempotency | Verified locally | Tests plus two-process CLI runs in STATUS.md |
 | DuckDB analytics and dbt transforms | Verified locally | Hand-checked figures; `dbt seed/run/test` green (PASS=2/3/8), re-run 2026-10-28 |
 | Daily pipeline runner and run history | Verified locally | `run-daily` records every run in SQLite (schema v2); API and CLI serve the history |
-| Event streaming on the file-log broker | Verified locally | Crash and redelivery tests pass; lag and DLQ gauges served from broker offsets |
+| Event streaming on the file-log broker | Verified locally | Crash and redelivery tests pass; lag and DLQ gauges served from broker offsets; dead-letter history recorded in SQLite (M12) |
 | FastAPI serving | Verified locally | Live uvicorn run plus 9 TestClient tests |
 | Real Kafka/Redpanda broker | Not run | Adapter, compose service, and runbook are preparation only |
 | Postgres store | Not run | Code and migration written; no live server has been used |
@@ -193,8 +193,12 @@ offsets commit, and later valid events still process.
 `api/app.py` is a FastAPI app factory wired to `SqliteStore` at
 `PHARMAFLOW_DB`. Endpoints are `/health`, `POST /imports`
 (multipart CSV upload), `GET /imports`, `/inventory`, `/alerts`,
-`/reconciliation`, `/data-quality`, `/metrics`, and (from M9)
-`/pipeline-runs` and `/pipeline-runs/latest`. The API was verified
+`/reconciliation`, `/data-quality`, `/metrics`, (from M9)
+`/pipeline-runs` and `/pipeline-runs/latest`, and (from M11)
+`/stream-consumption` and `/stream-consumption/latest`, and (from M12)
+`/dead-letters` and `/dead-letters/latest`, and (from M13)
+`POST /dead-letters/{id}/replay`, `/dead-letter-replays`, and
+`/dead-letter-replays/latest`. The API was verified
 live under uvicorn and by 9 TestClient tests, including a second
 app instance on the same database file reading inventory back.
 Serving from a threadpool surfaced one real fix: `SqliteStore`
@@ -255,6 +259,73 @@ under Airflow are not recorded, because the DAG wires the
 individual task callables rather than `run_daily`. The Postgres
 store does not persist runs.
 
+### Durable stream-consumption history (M11)
+
+Schema version 2 to 3 adds a `stream_consumption_runs` table; the
+migration is additive in the same way (a hand-built version 2
+database opens as version 3 with its rows intact). Every *completed*
+`stream-consume` run appends its finished `ConsumeResult` — records
+read, applied, duplicates, dead-lettered, lag before/after — and
+sets `result.record_id`. A run interrupted mid-consume (including
+the crash-simulation hook) records nothing. History is served by
+`GET /stream-consumption` (newest first, optional `?group=`, limit
+clamped to 1 to 100), `GET /stream-consumption/latest` (404 when no
+run exists), the `stream-consumption` CLI, and per-group summed
+consumption gauges on `/metrics`. The Postgres store does not persist
+consumption runs.
+
+### Durable dead-letter history (M12)
+
+Schema version 3 to 4 adds a `dead_letters` table; the migration
+is additive in the same way (a hand-built version 3 database opens
+as version 4 with its rows intact). Every poison event a *completed*
+`stream-consume` run dead-letters is appended — the consumer group,
+the event id (empty when the raw record carried none), the
+validation errors, and the source topic/partition/offset — and the
+row ids are collected on `result.dead_letter_ids`. A run interrupted
+mid-consume records nothing; its dead letters live in the broker
+DLQ topic only. History is served by `GET /dead-letters` (newest
+first, optional `?group=`, limit clamped to 1 to 100), `GET
+/dead-letters/latest` (404 when no dead letter exists), the
+`dead-letters` CLI, and per-group dead-letter totals
+(`pharmaflow_dead_letters_total`) on `/metrics`. A poison event
+re-read after a crash is recorded once per completed run that
+dead-lettered it. The Postgres store does not persist dead letters.
+
+### Dead-letter replay (M13)
+
+Schema version 4 to 5 adds a `dead_letter_replays` table; the
+migration is additive in the same way (a hand-built version 4
+database opens as version 5 with its rows intact). A recorded dead
+letter can be corrected and re-driven into the consumer:
+`dead-letter-replay` (CLI) or `POST /dead-letters/{id}/replay`
+(API, 201) reads the original record back from the broker at the
+dead letter's source coordinates, applies the caller's field
+corrections on top of it (`{"corrections": {...}}`; empty means
+re-publish the original unchanged), validates the result through
+the same `parse_event` rules the consumer applies, and
+re-publishes it to the original topic with the original event id.
+The event id cannot be changed by a correction (it is the dedupe
+key), except when the original record carried none — then the
+corrections must supply one. A payload that still fails validation
+is rejected (422 via the API, exit 2 via the CLI) and records
+nothing; the dead letter stays replayable. The replay is appended
+to `dead_letter_replays` — which dead letter it fixed, the group,
+the corrected payload as published, and the broker coordinates of
+the re-published record — and served by `GET /dead-letter-replays`
+(newest first, optional `?dead_letter_id=` / `?group=`, limit
+clamped to 1 to 100), `GET /dead-letter-replays/latest` (404 when
+no replay exists), the `dead-letter-replays` CLI, and per-group
+replay totals (`pharmaflow_dead_letter_replays_total`) on
+`/metrics`. Replaying the same dead letter twice appends two rows;
+the consumer's event-id dedupe makes the second copy a no-op when
+it is consumed, which is verified by test (applied 1, duplicates
+1). The replay never applies an event directly, so whether the
+corrected event was applied is decided by the next `stream-consume`
+run and shows up in its consumption history; a replayed event that
+still fails at apply time is dead-lettered again as a new row.
+The Postgres store does not persist replays.
+
 ## Layout
 
 ```text
@@ -263,12 +334,13 @@ pharmaflow/     core: ingestion, validation, quarantine, reconciliation, alerts,
                 data-quality report (M2), analytics.py (DuckDB, M3), transform.py (dbt model SQL, M3),
                 orchestration.py (task callables plus local runner, M3), streaming.py (M4: FileLogBroker
                 tested, Kafka adapter not run, idempotent consumer, DLQ), observability.py (M8: lag, DLQ,
-                and pipeline gauges in Prometheus text)
+                and pipeline gauges in Prometheus text; M11: stream-consumption gauges; M12: dead-letter gauges; M13: dead-letter replay totals)
 api/            FastAPI serving layer (M5: SQLite-backed via PHARMAFLOW_DB, verified live and by tests;
-                pipeline-runs endpoints added in M9)
+                pipeline-runs endpoints added in M9; stream-consumption endpoints added in M11;
+                dead-letters endpoints added in M12; dead-letter replay endpoints added in M13)
 benchmarks/     run_benchmarks.py and RESULTS.md with documented conditions (M6, M7, reproduction run)
 sample_data/    synthetic CSVs, including deliberately bad and duplicate rows; stream_events.jsonl (M4)
-tests/          pytest suite, 76 tests through M9
+tests/          pytest suite, 114 tests through M13
 db/             SQL migrations: 001 initial schema, Postgres dialect (M2, not run locally)
 dbt/            transformation project, executed in M3 (seed, run, and test green on DuckDB)
 airflow/        daily DAG: wiring only; task logic in pharmaflow/orchestration.py (M3, DAG not run)

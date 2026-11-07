@@ -12,13 +12,34 @@ Behaviour matches the in-memory ``PharmaStore``:
   after the store is closed and reopened;
 * schema creation is idempotent: ``CREATE TABLE IF NOT EXISTS`` plus a
   ``schema_version`` table, safe to run on every open. Version 2 (M9)
-  adds the ``pipeline_runs`` table; opening a version-1 database
+  adds the ``pipeline_runs`` table; version 3 (M11) adds the
+  ``stream_consumption_runs`` table; version 4 (M12) adds the
+  ``dead_letters`` table; version 5 (M13) adds the
+  ``dead_letter_replays`` table. Opening an older database
   migrates it additively (new table only, existing rows untouched)
-  and bumps the recorded version to 2.
+  and bumps the recorded version to 5.
 * pipeline runs (M9): ``record_pipeline_run`` / ``latest_pipeline_run``
   / ``list_pipeline_runs`` persist ``PipelineResult`` dicts (see
   ``orchestration.PipelineResult.to_dict``) so the last run survives a
   process restart and can be served by the API.
+* stream consumption runs (M11): ``record_stream_consumption`` /
+  ``latest_stream_consumption`` / ``list_stream_consumption`` persist
+  completed ``ConsumeResult`` outcomes (see ``streaming.ConsumeResult``)
+  so a group's consumption history survives a process restart and can
+  be served by the API and rendered as Prometheus gauges.
+* dead letters (M12): ``record_dead_letter`` / ``latest_dead_letter``
+  / ``list_dead_letters`` persist each poison event a completed
+  consume run dead-lettered (see ``streaming.DeadLetter``), so
+  poison events are queryable without reading the broker log. Only
+  completed runs record; a crash-interrupted run leaves its dead
+  letters in the broker DLQ topic only.
+* dead-letter replays (M13): ``record_dead_letter_replay`` /
+  ``latest_dead_letter_replay`` / ``list_dead_letter_replays``
+  persist each corrected re-publish of a recorded dead letter (see
+  ``streaming.DeadLetterReplay``), so a replay is traceable from the
+  dead letter it fixed to the broker coordinates of the corrected
+  event — and a second replay of the same dead letter is visible as
+  a second row, not a silent overwrite.
 
 Each mutation is committed immediately. That is deliberate: a process that
 dies mid-file has already durably recorded the rows it processed, and the
@@ -44,7 +65,7 @@ from .models import (
 )
 from .quarantine import QuarantineStore
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -111,6 +132,39 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     recorded_at TEXT NOT NULL,
     result_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS stream_consumption_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_name TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    records_read INTEGER NOT NULL DEFAULT 0,
+    applied INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    dlq INTEGER NOT NULL DEFAULT 0,
+    lag_before INTEGER NOT NULL DEFAULT 0,
+    lag_after INTEGER NOT NULL DEFAULT 0,
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dead_letters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_name TEXT NOT NULL,
+    event_id TEXT NOT NULL DEFAULT '',
+    topic TEXT NOT NULL,
+    partition INTEGER NOT NULL DEFAULT 0,
+    offset INTEGER NOT NULL DEFAULT 0,
+    errors_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dead_letter_replays (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dead_letter_id INTEGER NOT NULL,
+    group_name TEXT NOT NULL,
+    event_id TEXT NOT NULL DEFAULT '',
+    topic TEXT NOT NULL,
+    partition INTEGER NOT NULL DEFAULT 0,
+    offset INTEGER NOT NULL DEFAULT 0,
+    corrected_json TEXT NOT NULL,
+    replayed_at TEXT NOT NULL
+);
 """
 
 
@@ -146,6 +200,85 @@ class StoredPipelineRun:
             if o.get("status") == "failed":
                 return o.get("name")
         return None
+
+
+@dataclass
+class StoredStreamConsumption:
+    """One persisted, completed stream-consume run (M11).
+
+    A snapshot of a :class:`streaming.ConsumeResult` exactly as the
+    consume run finished it: records read, applied, duplicates
+    (redelivered events recognised by event id), poison events
+    dead-lettered, and lag before/after. ``run_id`` is the append-only
+    row id: ordering by it is insertion order, which is the definition
+    of "latest" even if clocks skew. Only runs that *completed* are
+    recorded — a run interrupted by a crash (or by the crash-simulation
+    hook) never reaches the record step, so its partial application
+    shows up in inventory/dedupe state, not in this history.
+    """
+
+    run_id: int
+    group: str
+    topic: str
+    records_read: int
+    applied: int
+    duplicates: int
+    dlq: int
+    lag_before: int
+    lag_after: int
+    recorded_at: str
+
+
+@dataclass
+class StoredDeadLetter:
+    """One poison event dead-lettered by a completed consume run (M12).
+
+    A snapshot of a :class:`streaming.DeadLetter` exactly as the run
+    finished it: the consumer group that dead-lettered it, the event
+    id (possibly empty for a malformed record), the validation errors,
+    and the source topic/partition/offset where the poison record
+    sits. ``record_id`` is the append-only row id: ordering by it is
+    insertion order, which is the definition of "latest" even if
+    clocks skew. Only completed runs record — a run interrupted by a
+    crash (or by the crash-simulation hook) never reaches the record
+    step, so its dead letters live in the broker DLQ topic only.
+    """
+
+    record_id: int
+    group: str
+    event_id: str
+    errors: list[str]
+    topic: str
+    partition: int
+    offset: int
+    recorded_at: str
+
+
+@dataclass
+class StoredDeadLetterReplay:
+    """One recorded dead-letter replay (M13).
+
+    A snapshot of a :class:`streaming.DeadLetterReplay`: which dead
+    letter it fixed (``dead_letter_id``), the consumer group it was
+    replayed for, the (unchanged) event id, the corrected event
+    payload as published, and the topic/partition/offset of the
+    re-published record. ``replay_id`` is the append-only row id:
+    ordering by it is insertion order, which is the definition of
+    "latest" even if clocks skew. A dead letter replayed twice has
+    two rows — the history is append-only, never overwritten — and
+    the consumer's event-id dedupe makes the second copy a no-op
+    when it is consumed.
+    """
+
+    replay_id: int
+    dead_letter_id: int
+    group: str
+    event_id: str
+    topic: str
+    partition: int
+    offset: int
+    corrected_event: dict
+    replayed_at: str
 
 
 class SqliteStore:
@@ -377,6 +510,362 @@ class SqliteStore:
             logical_date=date.fromisoformat(r["logical_date"]),
             recorded_at=r["recorded_at"],
             result_dict=json.loads(r["result_json"]),
+        )
+
+    # --- stream consumption runs (M11) ------------------------------------
+    def record_stream_consumption(self, result) -> int:
+        """Append one completed consume run; return its run id.
+
+        ``result`` is duck-typed (``group``/``topic``/``records_read``/
+        ``applied``/``duplicates``/``dlq``/``lag_before``/``lag_after``)
+        so tests can build it without running a consumer; a
+        :class:`streaming.ConsumeResult` satisfies it directly. Every
+        completed run is appended, including a run that read 0 records
+        (a no-op catch-up is still history: it proves the group was
+        checked and was current) and re-runs after a crash (the
+        duplicates column is what shows the redelivery). A recording
+        failure raises rather than silently losing the run record.
+        """
+        cur = self._conn.execute(
+            """
+            INSERT INTO stream_consumption_runs
+                (group_name, topic, records_read, applied, duplicates, dlq,
+                 lag_before, lag_after, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(result.group),
+                str(result.topic),
+                int(result.records_read),
+                int(result.applied),
+                int(result.duplicates),
+                int(result.dlq),
+                int(result.lag_before),
+                int(result.lag_after),
+                _now(),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def count_stream_consumption(self, group: str | None = None) -> int:
+        """Recorded consume runs, optionally for one group."""
+        if group is None:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM stream_consumption_runs"
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM stream_consumption_runs WHERE group_name = ?",
+                (group,),
+            ).fetchone()
+        return int(row["n"])
+
+    def latest_stream_consumption(self, group: str | None = None) -> StoredStreamConsumption | None:
+        """The most recently recorded consume run, or ``None``."""
+        rows = self.list_stream_consumption(group=group, limit=1)
+        return rows[0] if rows else None
+
+    def list_stream_consumption(self, group: str | None = None,
+                                limit: int = 20) -> list[StoredStreamConsumption]:
+        """Consume runs newest-first. ``limit`` is clamped to [1, 100]."""
+        limit = max(1, min(int(limit), 100))
+        if group is None:
+            rows = self._conn.execute(
+                "SELECT * FROM stream_consumption_runs ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM stream_consumption_runs WHERE group_name = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (group, limit),
+            ).fetchall()
+        return [self._stored_consumption_from_row(r) for r in rows]
+
+    def stream_consumption_totals(self, group: str | None = None) -> dict[str, int]:
+        """Summed counters over recorded consume runs, optionally one group.
+
+        Sums are over *completed, recorded* runs only — the same scope
+        as the history itself. A crash-interrupted run contributes
+        nothing (it was never recorded); the broker's own lag/DLQ
+        gauges (M8) remain the source of truth for live stream state.
+        """
+        if group is None:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(records_read), 0) AS records_read,"
+                " COALESCE(SUM(applied), 0) AS applied,"
+                " COALESCE(SUM(duplicates), 0) AS duplicates,"
+                " COALESCE(SUM(dlq), 0) AS dlq,"
+                " COUNT(*) AS runs FROM stream_consumption_runs"
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(records_read), 0) AS records_read,"
+                " COALESCE(SUM(applied), 0) AS applied,"
+                " COALESCE(SUM(duplicates), 0) AS duplicates,"
+                " COALESCE(SUM(dlq), 0) AS dlq,"
+                " COUNT(*) AS runs FROM stream_consumption_runs WHERE group_name = ?",
+                (group,),
+            ).fetchone()
+        return {
+            "records_read": int(row["records_read"]),
+            "applied": int(row["applied"]),
+            "duplicates": int(row["duplicates"]),
+            "dlq": int(row["dlq"]),
+            "runs": int(row["runs"]),
+        }
+
+    def stream_consumption_totals_by_group(self) -> dict[str, dict[str, int]]:
+        """Summed counters per consumer group, one GROUP BY query.
+
+        Groups that only appear in runs older than any listing limit
+        are still included — unlike deriving the group set from a
+        newest-first listing. Empty store -> empty dict.
+        """
+        rows = self._conn.execute(
+            "SELECT group_name,"
+            " COALESCE(SUM(records_read), 0) AS records_read,"
+            " COALESCE(SUM(applied), 0) AS applied,"
+            " COALESCE(SUM(duplicates), 0) AS duplicates,"
+            " COALESCE(SUM(dlq), 0) AS dlq,"
+            " COUNT(*) AS runs FROM stream_consumption_runs GROUP BY group_name"
+        ).fetchall()
+        return {
+            r["group_name"]: {
+                "records_read": int(r["records_read"]),
+                "applied": int(r["applied"]),
+                "duplicates": int(r["duplicates"]),
+                "dlq": int(r["dlq"]),
+                "runs": int(r["runs"]),
+            }
+            for r in rows
+        }
+
+    @staticmethod
+    def _stored_consumption_from_row(r) -> StoredStreamConsumption:
+        return StoredStreamConsumption(
+            run_id=int(r["id"]),
+            group=r["group_name"],
+            topic=r["topic"],
+            records_read=int(r["records_read"]),
+            applied=int(r["applied"]),
+            duplicates=int(r["duplicates"]),
+            dlq=int(r["dlq"]),
+            lag_before=int(r["lag_before"]),
+            lag_after=int(r["lag_after"]),
+            recorded_at=r["recorded_at"],
+        )
+
+    # --- dead letters (M12) -------------------------------------------------
+    def record_dead_letter(self, dead_letter) -> int:
+        """Append one dead-lettered poison event; return its record id.
+
+        ``dead_letter`` is duck-typed (``group``/``event_id``/
+        ``errors``/``source_topic``/``source_partition``/
+        ``source_offset``) so tests can build it without running a
+        consumer; a :class:`streaming.DeadLetter` satisfies it
+        directly. A recording failure raises rather than silently
+        losing the record. A poison event re-read after a crash is
+        recorded once per completed run that dead-lettered it — the
+        same per-run semantics as the consumption history's duplicates
+        column — so the same event id can legitimately appear more
+        than once, under different groups or different runs.
+        """
+        cur = self._conn.execute(
+            """
+            INSERT INTO dead_letters
+                (group_name, event_id, topic, partition, offset,
+                 errors_json, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(dead_letter.group),
+                str(dead_letter.event_id or ""),
+                str(dead_letter.source_topic),
+                int(dead_letter.source_partition),
+                int(dead_letter.source_offset),
+                json.dumps(list(dead_letter.errors), sort_keys=True),
+                _now(),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def count_dead_letters(self, group: str | None = None) -> int:
+        """Recorded dead letters, optionally for one group."""
+        if group is None:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM dead_letters"
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM dead_letters WHERE group_name = ?",
+                (group,),
+            ).fetchone()
+        return int(row["n"])
+
+    def latest_dead_letter(self, group: str | None = None) -> StoredDeadLetter | None:
+        """The most recently recorded dead letter, or ``None``."""
+        rows = self.list_dead_letters(group=group, limit=1)
+        return rows[0] if rows else None
+
+    def list_dead_letters(self, group: str | None = None,
+                          limit: int = 20) -> list[StoredDeadLetter]:
+        """Dead letters newest-first. ``limit`` is clamped to [1, 100]."""
+        limit = max(1, min(int(limit), 100))
+        if group is None:
+            rows = self._conn.execute(
+                "SELECT * FROM dead_letters ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM dead_letters WHERE group_name = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (group, limit),
+            ).fetchall()
+        return [self._stored_dead_letter_from_row(r) for r in rows]
+
+    def dead_letter_totals_by_group(self) -> dict[str, int]:
+        """Recorded dead letters per consumer group, one GROUP BY query.
+
+        Groups that only appear in rows older than any listing limit
+        are still included — unlike deriving the group set from a
+        newest-first listing. Empty store -> empty dict.
+        """
+        rows = self._conn.execute(
+            "SELECT group_name, COUNT(*) AS n FROM dead_letters "
+            "GROUP BY group_name"
+        ).fetchall()
+        return {r["group_name"]: int(r["n"]) for r in rows}
+
+    @staticmethod
+    def _stored_dead_letter_from_row(r) -> StoredDeadLetter:
+        return StoredDeadLetter(
+            record_id=int(r["id"]),
+            group=r["group_name"],
+            event_id=r["event_id"],
+            errors=json.loads(r["errors_json"]),
+            topic=r["topic"],
+            partition=int(r["partition"]),
+            offset=int(r["offset"]),
+            recorded_at=r["recorded_at"],
+        )
+
+    # --- dead-letter replays (M13) ----------------------------------------
+    def get_dead_letter(self, record_id: int) -> StoredDeadLetter | None:
+        """One recorded dead letter by its row id, or ``None``."""
+        row = self._conn.execute(
+            "SELECT * FROM dead_letters WHERE id = ?", (int(record_id),)
+        ).fetchone()
+        return self._stored_dead_letter_from_row(row) if row else None
+
+    def record_dead_letter_replay(self, replay) -> int:
+        """Append one dead-letter replay; return its replay id.
+
+        ``replay`` is duck-typed (``dead_letter_id``/``group``/
+        ``event_id``/``topic``/``partition``/``offset``/
+        ``corrected_event``) so tests can build it without publishing
+        to a broker; a :class:`streaming.DeadLetterReplay` satisfies
+        it directly. A recording failure raises rather than silently
+        losing the record. Replaying the same dead letter twice
+        appends two rows — the history is append-only, and the
+        consumer's event-id dedupe is what makes the second copy a
+        no-op, not any uniqueness rule here.
+        """
+        cur = self._conn.execute(
+            """
+            INSERT INTO dead_letter_replays
+                (dead_letter_id, group_name, event_id, topic, partition,
+                 offset, corrected_json, replayed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(replay.dead_letter_id),
+                str(replay.group),
+                str(replay.event_id or ""),
+                str(replay.topic),
+                int(replay.partition),
+                int(replay.offset),
+                json.dumps(dict(replay.corrected_event), sort_keys=True),
+                replay.replayed_at or _now(),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def count_dead_letter_replays(self, group: str | None = None) -> int:
+        """Recorded dead-letter replays, optionally for one group."""
+        if group is None:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM dead_letter_replays"
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM dead_letter_replays "
+                "WHERE group_name = ?",
+                (group,),
+            ).fetchone()
+        return int(row["n"])
+
+    def latest_dead_letter_replay(
+        self, dead_letter_id: int | None = None,
+        group: str | None = None,
+    ) -> StoredDeadLetterReplay | None:
+        """The most recently recorded replay, or ``None``."""
+        rows = self.list_dead_letter_replays(
+            dead_letter_id=dead_letter_id, group=group, limit=1)
+        return rows[0] if rows else None
+
+    def list_dead_letter_replays(
+        self, dead_letter_id: int | None = None,
+        group: str | None = None, limit: int = 20,
+    ) -> list[StoredDeadLetterReplay]:
+        """Replays newest-first. ``limit`` is clamped to [1, 100]."""
+        limit = max(1, min(int(limit), 100))
+        clauses: list[str] = []
+        params: list = []
+        if dead_letter_id is not None:
+            clauses.append("dead_letter_id = ?")
+            params.append(int(dead_letter_id))
+        if group is not None:
+            clauses.append("group_name = ?")
+            params.append(group)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT * FROM dead_letter_replays {where} "
+            "ORDER BY id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [self._stored_dead_letter_replay_from_row(r) for r in rows]
+
+    def dead_letter_replay_totals_by_group(self) -> dict[str, int]:
+        """Recorded replays per consumer group, one GROUP BY query.
+
+        Groups that only appear in rows older than any listing limit
+        are still included — unlike deriving the group set from a
+        newest-first listing. Empty store -> empty dict.
+        """
+        rows = self._conn.execute(
+            "SELECT group_name, COUNT(*) AS n FROM dead_letter_replays "
+            "GROUP BY group_name"
+        ).fetchall()
+        return {r["group_name"]: int(r["n"]) for r in rows}
+
+    @staticmethod
+    def _stored_dead_letter_replay_from_row(r) -> StoredDeadLetterReplay:
+        return StoredDeadLetterReplay(
+            replay_id=int(r["id"]),
+            dead_letter_id=int(r["dead_letter_id"]),
+            group=r["group_name"],
+            event_id=r["event_id"],
+            topic=r["topic"],
+            partition=int(r["partition"]),
+            offset=int(r["offset"]),
+            corrected_event=json.loads(r["corrected_json"]),
+            replayed_at=r["replayed_at"],
         )
 
     # --- read views (fresh snapshots from the DB) -----------------------

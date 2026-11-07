@@ -1,4 +1,4 @@
-# PharmaFlow observability (M8, M9, M10)
+# PharmaFlow observability (M8, M9, M10, M11, M12, M13)
 
 ## What is exposed, and where it comes from
 
@@ -11,6 +11,10 @@
 | `pharmaflow_pipeline_succeeded{logical_date}` | 1/0 for the last *stored* daily run | `pipeline_runs` table (M9); label identifies the run |
 | `pharmaflow_pipeline_task_success{task,logical_date}` / `pharmaflow_pipeline_task_attempts{task,logical_date}` | Per-task outcome / attempts of the last stored run | Same `pipeline_runs` row |
 | `pharmaflow_pipeline_runs_total` | Runs recorded in the store | `COUNT(*)` on `pipeline_runs` |
+| `pharmaflow_stream_consumption_runs_total{group}` | Completed consume runs recorded for a group | `stream_consumption_runs` table (M11) |
+| `pharmaflow_stream_consumed_read_total{group}` / `pharmaflow_stream_consumed_applied_total{group}` / `pharmaflow_stream_consumed_duplicates_total{group}` / `pharmaflow_stream_consumed_dlq_total{group}` | Sums over completed, recorded consume runs for a group | Same table (M11); sums, not live broker state |
+| `pharmaflow_dead_letters_total{group}` | Poison events dead-lettered by completed consume runs for a group | `dead_letters` table (M12); count per group, not live broker state |
+| `pharmaflow_dead_letter_replays_total{group}` | Corrected re-publishes of recorded dead letters for a group | `dead_letter_replays` table (M13); count per group — a re-publish, not a claim the event was applied |
 | `pharmaflow_pipeline_succeeded` (unlabeled) | 1/0 for an in-memory `PipelineResult` | `render_pipeline_prometheus` without a label (M8 form, unchanged) |
 
 The streaming numbers are deliberately **not** a second counter: they
@@ -80,8 +84,137 @@ audit table already held everything. Verified by
 `tests/test_m10.py`: cross-restart SQLite reopen, a second FastAPI
 app instance on the same DB file, and two separate CLI processes.
 
+## Stream consumption history is stored (M11)
+
+Every *completed* `stream-consume` execution is appended to the
+`stream_consumption_runs` table in the operational SQLite database
+(schema version 3. Opening a version-2 database migrates additively:
+a new table only, existing rows untouched, version bumped to 3).
+The recorded row is the finished `ConsumeResult`: group, topic,
+records read, applied, duplicates (redelivered events recognised by
+event id), poison events dead-lettered, and lag before/after. A
+no-op catch-up (read 0) is still recorded — it proves the group was
+checked and was current — and a re-run after a crash records the
+duplicates column showing the redelivery. History is queryable
+without re-running anything:
+
+```bash
+python -m pharmaflow stream-consumption --db pharmaflow.db            # newest first
+python -m pharmaflow stream-consumption --db pharmaflow.db --group reconciliation-v1 --latest --json
+curl localhost:8000/stream-consumption/latest
+curl localhost:8000/metrics   # per-group summed consumption gauges
+```
+
+`GET /stream-consumption/latest` returns 404 when no consume run has
+been recorded yet, and `/metrics` serves no stream-consumption gauges
+in that case. The gauges are sums over recorded, completed runs —
+they answer "what has this group consumed so far?", while the M8
+broker gauges answer "what is waiting right now?". A run interrupted
+mid-consume (including the crash-simulation hook) is never recorded:
+its partial application shows up in inventory and in the dedupe
+table, not in this history. The Postgres store does not persist
+consumption runs (code-only path, unverified).
+
+## Dead letters are stored (M12)
+
+Every poison event a *completed* `stream-consume` run dead-letters
+is appended to the `dead_letters` table in the operational SQLite
+database (schema version 4. Opening a version-3 database migrates
+additively: a new table only, existing rows untouched, version
+bumped to 4). The recorded row is the finished `DeadLetter`: the
+consumer group that dead-lettered it, the event id (empty when the
+raw record carried none), the validation errors, and the source
+topic/partition/offset where the poison record sits in the broker
+log. History is queryable without reading the broker log:
+
+```bash
+python -m pharmaflow dead-letters --db pharmaflow.db            # newest first
+python -m pharmaflow dead-letters --db pharmaflow.db --group reconciliation-v1 --latest --json
+curl localhost:8000/dead-letters/latest
+curl localhost:8000/metrics   # per-group dead-letter totals
+```
+
+`GET /dead-letters/latest` returns 404 when no dead letter has been
+recorded yet, and `/metrics` serves no dead-letter gauge in that
+case. The gauge is a count per group over completed, recorded runs —
+it answers "which poison events have we seen, and how many per
+group?", while the M8 `pharmaflow_stream_dlq_records` gauge answers
+"how many records are waiting in the DLQ topic right now?". A run
+interrupted mid-consume is never recorded: its dead letters live in
+the broker DLQ topic only. A poison event re-read after a crash is
+recorded once per completed run that dead-lettered it (the same
+per-run semantics as the consumption history's duplicates column),
+so one event id can legitimately appear more than once, under
+different groups or different runs. The Postgres store does not
+persist dead letters (code-only path, unverified).
+
+## Dead letters can be replayed (M13)
+
+A recorded dead letter can be corrected and re-driven into the
+consumer instead of sitting in the DLQ forever:
+
+```bash
+python -m pharmaflow dead-letter-replay --db pharmaflow.db --log-dir /var/pharmaflow/broker \
+  --id 1 --corrections '{"quantity_sold": 5}'
+python -m pharmaflow dead-letter-replays --db pharmaflow.db --json
+curl -X POST localhost:8000/dead-letters/1/replay \
+  -H 'Content-Type: application/json' -d '{"corrections": {"quantity_sold": 5}}'
+curl localhost:8000/dead-letter-replays/latest
+curl localhost:8000/metrics   # per-group replay totals
+```
+
+The replay reads the original record back from the broker at the
+dead letter's source coordinates, applies the caller's field
+corrections on top of it, validates the result through the same
+`parse_event` rules the consumer applies, and re-publishes it to
+the original topic **with the original event id**. Omitting
+`--corrections` re-publishes the original payload unchanged, which
+is the right fix when the poison was a state failure at apply time
+(a sale for a SKU that did not exist yet) rather than a malformed
+payload. A payload that still fails validation is rejected and
+records nothing; the dead letter stays replayable. The event id
+cannot be changed by a correction (it is the dedupe key), except
+when the original record carried none — then the corrections must
+supply one.
+
+The replay is appended to the `dead_letter_replays` table (schema
+version 5. Opening a version-4 database migrates additively: a new
+table only, existing rows untouched, version bumped to 5): which
+dead letter it fixed, the group, the corrected payload as
+published, and the broker coordinates of the re-published record.
+Replaying the same dead letter twice appends two rows; the
+consumer's event-id dedupe is what makes the second copy a no-op
+when it is consumed, not any uniqueness rule in the replay table.
+
+The replay gauge counts re-publishes, not applications: whether
+the corrected event was *applied* is decided by the next
+`stream-consume` run and shows up in its consumption history
+(M11). `POST /dead-letters/{id}/replay` returns 404 for an unknown
+dead-letter id, 422 when the corrected payload still fails
+validation, 400 when the replay cannot proceed (a correction
+changing the event id, or the original record missing from the
+broker log), and 503 when no broker log directory is configured
+(`PHARMAFLOW_STREAM_LOG_DIR`). `GET /dead-letter-replays/latest`
+returns 404 when no replay has been recorded yet, and `/metrics`
+serves no replay gauge in that case. The Postgres store does not
+persist replays (code-only path, unverified).
+
 ## Honest limits
 
+- Stream-consumption gauges sum over recorded, completed runs only;
+  a crash-interrupted run contributes nothing, and consumption under
+  the real Kafka/Redpanda adapter (unverified, no broker here) is not
+  recorded by this mechanism.
+- Dead-letter history records completed runs only; a poison event
+  dead-lettered by a crash-interrupted run is in the broker DLQ topic
+  only, and a re-read poison event is recorded once per completed run
+  that dead-lettered it. The Postgres store does not persist dead
+  letters.
+- Dead-letter replays re-publish through the broker; they never
+  apply an event directly, so a replayed event that still fails at
+  apply time is dead-lettered again by the next consume run as a
+  *new* dead-letter row. The replay gauge counts re-publishes, not
+  applications.
 - Ingestion counters are durable from M10 onward (see above); the
   per-process session counters still exist in-memory and are what the
   foundation tests assert. The durable view is the one `/metrics`
