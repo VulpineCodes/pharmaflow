@@ -31,8 +31,16 @@ in production without adding a new dependency or a new store:
   and re-driven. The replay record itself (which dead letter, the
   corrected payload, the broker coordinates of the re-published
   record) is served by the API; the gauge here is only the
-  per-group total. Whether a replay was *applied* is answered by
-  the next consume run's history (M11), not by this gauge.
+  per-group total.
+* **replay outcomes** — per-group, per-outcome counts of what the
+  next completed consume run did with each re-published replay
+  (M14, ``dead_letter_replay_outcomes`` table): applied, duplicate,
+  or dead-lettered again. This is what closes the loop the M13
+  gauge deliberately left open — the replay gauge says the event
+  was re-published, this one says what happened next. A replay
+  with no outcome row has not been consumed yet, so it appears in
+  neither count; "pending" is the absence of a row, not a gauge
+  value.
 
 What this is NOT: a Prometheus server, a Grafana dashboard, or an
 alert rule. The ``/metrics`` endpoint (M5) serves the ingestion
@@ -239,8 +247,9 @@ def render_dead_letter_replays_prometheus(totals_by_group: dict[str, int]) -> st
     recorded dead letters — not live broker state, and not a claim
     that the replayed events were applied: application is decided
     by the next consume run and shows up in the consumption
-    history (M11). An empty mapping renders nothing, so an app with
-    no recorded replays serves no replay gauge.
+    history (M11) and, per replay, in the outcome gauge (M14).
+    An empty mapping renders nothing, so an app with no recorded
+    replays serves no replay gauge.
     """
     if not totals_by_group:
         return ""
@@ -251,6 +260,40 @@ def render_dead_letter_replays_prometheus(totals_by_group: dict[str, int]) -> st
         lines.append(
             f"pharmaflow_dead_letter_replays_total{{{_labels(group=group)}}} {totals_by_group[group]}"
         )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Replay outcomes (M14)
+# ---------------------------------------------------------------------------
+
+def render_replay_outcomes_prometheus(
+    totals_by_group: dict[str, dict[str, int]],
+) -> str:
+    """Render recorded replay outcomes as Prometheus gauges.
+
+    ``totals_by_group`` maps a consumer group to a per-outcome
+    mapping (``applied``/``duplicate``/``dead_lettered`` to counts),
+    as returned by
+    ``SqliteStore.replay_outcome_totals_by_group``. These are counts
+    over the durable history — what the next *completed* consume run
+    did with each re-published replay — not live broker state. A
+    replay that has not been consumed yet has no outcome row and
+    contributes to no count here; "pending" is the absence of a row,
+    visible through the replay endpoints, not through this gauge.
+    An empty mapping renders nothing, so an app with no recorded
+    outcomes serves no outcome gauge.
+    """
+    if not totals_by_group:
+        return ""
+    lines: list[str] = []
+    lines.append("# HELP pharmaflow_dead_letter_replay_outcomes_total Outcomes recorded for replayed dead letters, per consumer group and outcome.")
+    lines.append("# TYPE pharmaflow_dead_letter_replay_outcomes_total gauge")
+    for group in sorted(totals_by_group):
+        for outcome in sorted(totals_by_group[group]):
+            lines.append(
+                f"pharmaflow_dead_letter_replay_outcomes_total{{{_labels(group=group, outcome=outcome)}}} {totals_by_group[group][outcome]}"
+            )
     return "\n".join(lines) + "\n"
 
 

@@ -196,7 +196,7 @@ def test_replay_corrected_sale_applies_on_next_consume(tmp_path):
     assert result.records_read == 1 and result.applied == 1
     assert result.duplicates == 0 and result.dlq == 0
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         assert store.inventory["MED-001"].quantity_on_hand == 95
         # The dead letter is still in history (append-only); the
         # replay is recorded alongside it.
@@ -350,7 +350,7 @@ def test_v4_database_migrates_additively(tmp_path):
     db = tmp_path / "pharma.db"
     _make_v4_db(db)
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         # Pre-existing data survived the migration untouched.
         assert len(store.inventory) == 1
         assert store.inventory["MED-001"].quantity_on_hand == 120
@@ -373,7 +373,7 @@ def test_v4_database_migrates_additively(tmp_path):
         assert store.get_dead_letter(99) is None
     # Reopening stays v5 and the rows are still there.
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         assert store.count_dead_letter_replays() == 1
 
 

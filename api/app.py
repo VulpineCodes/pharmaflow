@@ -91,6 +91,19 @@ def create_app(db_path: str | Path | None = None,
     totals. Replay requires a broker log directory configured (the
     same ``stream_log_dir`` argument / ``PHARMAFLOW_STREAM_LOG_DIR``
     env var the streaming gauges use) and returns 503 without one.
+
+    M14 replay outcomes: ``GET /replay-outcomes`` (newest first,
+    optional ``?replay_id=`` / ``?group=`` / ``?outcome=``) and
+    ``GET /replay-outcomes/latest`` serve the durable outcome
+    history recorded by ``stream-consume`` — one row per (replay,
+    group) saying what the group's next completed consume run did
+    with the re-published record (applied / duplicate /
+    dead-lettered again, with the new dead-letter row id when
+    applicable, and the consumption run id). ``GET
+    /dead-letter-replays/{replay_id}`` returns one replay with its
+    outcomes embedded; an empty outcomes list means the replay has
+    not been consumed yet (pending). ``/metrics`` additionally
+    renders per-group, per-outcome totals.
     """
     path = Path(db_path or os.environ.get("PHARMAFLOW_DB") or "pharmaflow.db")
     store = SqliteStore(path)
@@ -100,7 +113,7 @@ def create_app(db_path: str | Path | None = None,
         stream_groups = [g.strip() for g in env_groups.split(",") if g.strip()]
     app_state_stream = (Path(stream_dir), list(stream_groups)) if stream_dir else None
 
-    app = FastAPI(title="PharmaFlow API", version="0.8.0")
+    app = FastAPI(title="PharmaFlow API", version="0.9.0")
     app.state.store = store
     app.state.db_path = str(path)
 
@@ -395,6 +408,78 @@ def create_app(db_path: str | Path | None = None,
                                 detail="no dead-letter replays recorded")
         return _replay_response(record)
 
+    def _outcome_response(outcome):
+        """Serialise a StoredReplayOutcome for the outcome endpoints."""
+        return {
+            "outcome_id": outcome.outcome_id,
+            "replay_id": outcome.replay_id,
+            "dead_letter_id": outcome.dead_letter_id,
+            "group": outcome.group,
+            "event_id": outcome.event_id,
+            "outcome": outcome.outcome,
+            "new_dead_letter_id": outcome.new_dead_letter_id,
+            "consumption_run_id": outcome.consumption_run_id,
+            "recorded_at": outcome.recorded_at,
+        }
+
+    @app.get("/dead-letter-replays/{replay_id}")
+    def dead_letter_replay_one(replay_id: int):
+        """One recorded replay, with its outcomes embedded (M14).
+
+        ``outcomes`` is empty while the replay has not been consumed
+        yet (pending) — a replay's outcome is recorded by the next
+        completed ``stream-consume`` run for its group, not at
+        replay time. A ``dead_lettered`` outcome carries the new
+        dead-letter row id, so the chain dead letter -> replay ->
+        outcome -> new dead letter is traversable from this one
+        response.
+        """
+        from fastapi import HTTPException
+
+        record = store.get_dead_letter_replay(replay_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no dead-letter replay recorded with id {replay_id}")
+        body = _replay_response(record)
+        body["outcomes"] = [
+            _outcome_response(o)
+            for o in store.list_replay_outcomes(replay_id=replay_id)
+        ]
+        return body
+
+    @app.get("/replay-outcomes")
+    def replay_outcomes(replay_id: int | None = Query(default=None),
+                        group: str | None = Query(default=None),
+                        outcome: str | None = Query(default=None),
+                        limit: int = Query(default=20, ge=1, le=100)):
+        """Recorded replay outcomes, newest first (M14).
+
+        One row per (replay, group): what the group's next completed
+        consume run did with the re-published record — applied,
+        duplicate, or dead-lettered again. A replay with no row here
+        has not been consumed yet. ``outcome`` filters to one of
+        ``applied`` / ``duplicate`` / ``dead_lettered``.
+        """
+        return [
+            _outcome_response(o)
+            for o in store.list_replay_outcomes(
+                replay_id=replay_id, group=group, outcome=outcome,
+                limit=limit)
+        ]
+
+    @app.get("/replay-outcomes/latest")
+    def replay_outcomes_latest(replay_id: int | None = Query(default=None),
+                               group: str | None = Query(default=None)):
+        """The most recently recorded replay outcome, or 404 when none exists."""
+        from fastapi import HTTPException
+
+        record = store.latest_replay_outcome(replay_id=replay_id, group=group)
+        if record is None:
+            raise HTTPException(status_code=404,
+                                detail="no replay outcomes recorded")
+        return _outcome_response(record)
+
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics():
         # M10: ingestion counters are derived from the persisted record,
@@ -461,6 +546,19 @@ def create_app(db_path: str | Path | None = None,
 
             text += render_dead_letter_replays_prometheus(
                 store.dead_letter_replay_totals_by_group()
+            )
+        # M14: replay-outcome totals count, per group and per outcome,
+        # what the next completed consume run did with each
+        # re-published replay. No recorded outcomes yet -> no outcome
+        # gauge. A replay with no outcome row (not consumed yet)
+        # contributes to no count here.
+        if store.count_replay_outcomes() > 0:
+            from pharmaflow.observability import (
+                render_replay_outcomes_prometheus,
+            )
+
+            text += render_replay_outcomes_prometheus(
+                store.replay_outcome_totals_by_group()
             )
         return text
 

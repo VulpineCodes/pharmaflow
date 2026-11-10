@@ -188,7 +188,7 @@ def test_consume_once_records_dead_letters(tmp_path):
     assert _dlq_broker_records(FileLogBroker(log_dir)) == 2
     # A fresh store instance on the same file sees the recorded rows.
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         assert store.count_dead_letters() == 2
         assert store.count_stream_consumption() == 1
         letters = store.list_dead_letters()
@@ -285,7 +285,7 @@ def test_v3_database_migrates_additively(tmp_path):
     db = tmp_path / "pharma.db"
     _make_v3_db(db)
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         # Pre-existing data survived the migration untouched.
         assert len(store.inventory) == 1
         assert store.inventory["MED-001"].quantity_on_hand == 120
@@ -298,7 +298,7 @@ def test_v3_database_migrates_additively(tmp_path):
     assert result.record_id == 1
     assert result.dead_letter_ids == [1, 2]
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         assert store.count_dead_letters() == 2
         assert store.count_stream_consumption() == 1
 

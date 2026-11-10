@@ -15,9 +15,10 @@ Behaviour matches the in-memory ``PharmaStore``:
   adds the ``pipeline_runs`` table; version 3 (M11) adds the
   ``stream_consumption_runs`` table; version 4 (M12) adds the
   ``dead_letters`` table; version 5 (M13) adds the
-  ``dead_letter_replays`` table. Opening an older database
+  ``dead_letter_replays`` table; version 6 (M14) adds the
+  ``dead_letter_replay_outcomes`` table. Opening an older database
   migrates it additively (new table only, existing rows untouched)
-  and bumps the recorded version to 5.
+  and bumps the recorded version to 6.
 * pipeline runs (M9): ``record_pipeline_run`` / ``latest_pipeline_run``
   / ``list_pipeline_runs`` persist ``PipelineResult`` dicts (see
   ``orchestration.PipelineResult.to_dict``) so the last run survives a
@@ -40,6 +41,14 @@ Behaviour matches the in-memory ``PharmaStore``:
   dead letter it fixed to the broker coordinates of the corrected
   event — and a second replay of the same dead letter is visible as
   a second row, not a silent overwrite.
+* replay outcomes (M14): ``record_replay_outcome`` /
+  ``latest_replay_outcome`` / ``list_replay_outcomes`` persist what
+  the replay's group's next completed consume run did with the
+  re-published record (see ``streaming.ReplayOutcome``) — applied,
+  duplicate, or dead-lettered again, with the new dead-letter row
+  id when applicable — so an operator can close the loop on a
+  replay without cross-referencing two histories by event id. A
+  replay with no outcome row has not been consumed yet.
 
 Each mutation is committed immediately. That is deliberate: a process that
 dies mid-file has already durably recorded the rows it processed, and the
@@ -65,7 +74,7 @@ from .models import (
 )
 from .quarantine import QuarantineStore
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -164,6 +173,18 @@ CREATE TABLE IF NOT EXISTS dead_letter_replays (
     offset INTEGER NOT NULL DEFAULT 0,
     corrected_json TEXT NOT NULL,
     replayed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dead_letter_replay_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    replay_id INTEGER NOT NULL,
+    dead_letter_id INTEGER NOT NULL,
+    group_name TEXT NOT NULL,
+    event_id TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL,
+    new_dead_letter_id INTEGER,
+    consumption_run_id INTEGER,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (replay_id, group_name)
 );
 """
 
@@ -279,6 +300,39 @@ class StoredDeadLetterReplay:
     offset: int
     corrected_event: dict
     replayed_at: str
+
+
+@dataclass
+class StoredReplayOutcome:
+    """One recorded replay outcome (M14).
+
+    A snapshot of a :class:`streaming.ReplayOutcome`: which replay
+    it closes the loop on (``replay_id``, and the dead letter that
+    replay fixed), the consumer group whose completed consume run
+    decided it, the (unchanged) event id, and the outcome —
+    ``applied``, ``duplicate``, or ``dead_lettered``. When the
+    replayed event was dead-lettered again, ``new_dead_letter_id``
+    is the row id of the fresh dead letter, so the chain
+    dead letter -> replay -> outcome -> new dead letter is
+    traversable without cross-referencing histories by event id.
+    ``consumption_run_id`` is the recorded consume run that decided
+    the outcome. ``outcome_id`` is the append-only row id: ordering
+    by it is insertion order, which is the definition of "latest"
+    even if clocks skew. One outcome per (replay, group) — enforced
+    by a UNIQUE constraint — so a replay's outcome is never
+    overwritten by a later run; a replay with no row here has not
+    been consumed yet.
+    """
+
+    outcome_id: int
+    replay_id: int
+    dead_letter_id: int
+    group: str
+    event_id: str
+    outcome: str
+    new_dead_letter_id: int | None
+    consumption_run_id: int | None
+    recorded_at: str
 
 
 class SqliteStore:
@@ -761,6 +815,13 @@ class SqliteStore:
         ).fetchone()
         return self._stored_dead_letter_from_row(row) if row else None
 
+    def get_dead_letter_replay(self, replay_id: int) -> StoredDeadLetterReplay | None:
+        """One recorded dead-letter replay by its row id, or ``None``."""
+        row = self._conn.execute(
+            "SELECT * FROM dead_letter_replays WHERE id = ?", (int(replay_id),)
+        ).fetchone()
+        return self._stored_dead_letter_replay_from_row(row) if row else None
+
     def record_dead_letter_replay(self, replay) -> int:
         """Append one dead-letter replay; return its replay id.
 
@@ -866,6 +927,178 @@ class SqliteStore:
             offset=int(r["offset"]),
             corrected_event=json.loads(r["corrected_json"]),
             replayed_at=r["replayed_at"],
+        )
+
+    # --- replay outcomes (M14) ------------------------------------------
+    def record_replay_outcome(self, outcome) -> int:
+        """Append one replay outcome; return its outcome id.
+
+        ``outcome`` is duck-typed (``replay_id``/``dead_letter_id``/
+        ``group``/``event_id``/``outcome``/``new_dead_letter_id``/
+        ``consumption_run_id``) so tests can build it without running
+        a consumer; a :class:`streaming.ReplayOutcome` satisfies it
+        directly. One outcome per (replay, group): a second recording
+        for the same pair raises (UNIQUE constraint) rather than
+        silently overwriting the first — a replay's outcome is
+        decided once, by the first completed consume run that
+        processes the re-published record. A recording failure raises
+        rather than silently losing the record.
+        """
+        cur = self._conn.execute(
+            """
+            INSERT INTO dead_letter_replay_outcomes
+                (replay_id, dead_letter_id, group_name, event_id,
+                 outcome, new_dead_letter_id, consumption_run_id,
+                 recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(outcome.replay_id),
+                int(outcome.dead_letter_id),
+                str(outcome.group),
+                str(outcome.event_id or ""),
+                str(outcome.outcome),
+                (int(outcome.new_dead_letter_id)
+                 if outcome.new_dead_letter_id is not None else None),
+                (int(outcome.consumption_run_id)
+                 if outcome.consumption_run_id is not None else None),
+                outcome.recorded_at or _now(),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def get_replay_outcome(self, replay_id: int,
+                           group: str | None = None) -> StoredReplayOutcome | None:
+        """The recorded outcome for one replay (and group), or ``None``.
+
+        ``None`` means the replay has no outcome yet for that group —
+        it has not been consumed (pending), not that it failed.
+        """
+        if group is None:
+            row = self._conn.execute(
+                "SELECT * FROM dead_letter_replay_outcomes "
+                "WHERE replay_id = ? ORDER BY id DESC LIMIT 1",
+                (int(replay_id),),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM dead_letter_replay_outcomes "
+                "WHERE replay_id = ? AND group_name = ?",
+                (int(replay_id), group),
+            ).fetchone()
+        return self._stored_replay_outcome_from_row(row) if row else None
+
+    def find_unresolved_replay_at_coordinates(
+        self, topic: str, partition: int, offset: int, group: str,
+    ) -> StoredDeadLetterReplay | None:
+        """A recorded replay at these broker coordinates, for this
+        group, that has no outcome yet — or ``None``.
+
+        Coordinates identify the re-published record even when the
+        run could not recover its event id, so this is the link
+        ``consume_once`` uses to decide which replay a processed
+        record closes the loop on. At most one replay sits at any
+        (topic, partition, offset): each replay publishes exactly
+        one record.
+        """
+        row = self._conn.execute(
+            """
+            SELECT * FROM dead_letter_replays r
+            WHERE r.topic = ? AND r.partition = ? AND r.offset = ?
+              AND r.group_name = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM dead_letter_replay_outcomes o
+                  WHERE o.replay_id = r.id AND o.group_name = r.group_name)
+            ORDER BY r.id ASC LIMIT 1
+            """,
+            (str(topic), int(partition), int(offset), group),
+        ).fetchone()
+        return self._stored_dead_letter_replay_from_row(row) if row else None
+
+    def count_replay_outcomes(self, group: str | None = None) -> int:
+        """Recorded replay outcomes, optionally for one group."""
+        if group is None:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM dead_letter_replay_outcomes"
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM dead_letter_replay_outcomes "
+                "WHERE group_name = ?",
+                (group,),
+            ).fetchone()
+        return int(row["n"])
+
+    def latest_replay_outcome(
+        self, replay_id: int | None = None,
+        group: str | None = None,
+    ) -> StoredReplayOutcome | None:
+        """The most recently recorded replay outcome, or ``None``."""
+        rows = self.list_replay_outcomes(
+            replay_id=replay_id, group=group, limit=1)
+        return rows[0] if rows else None
+
+    def list_replay_outcomes(
+        self, replay_id: int | None = None,
+        group: str | None = None, outcome: str | None = None,
+        limit: int = 20,
+    ) -> list[StoredReplayOutcome]:
+        """Replay outcomes newest-first. ``limit`` is clamped to [1, 100]."""
+        limit = max(1, min(int(limit), 100))
+        clauses: list[str] = []
+        params: list = []
+        if replay_id is not None:
+            clauses.append("replay_id = ?")
+            params.append(int(replay_id))
+        if group is not None:
+            clauses.append("group_name = ?")
+            params.append(group)
+        if outcome is not None:
+            clauses.append("outcome = ?")
+            params.append(outcome)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT * FROM dead_letter_replay_outcomes {where} "
+            "ORDER BY id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [self._stored_replay_outcome_from_row(r) for r in rows]
+
+    def replay_outcome_totals_by_group(self) -> dict[str, dict[str, int]]:
+        """Recorded replay outcomes per consumer group, per outcome.
+
+        One GROUP BY query, so groups that only appear in rows older
+        than any listing limit are still included. Empty store ->
+        empty dict. The per-outcome split is what lets ``/metrics``
+        show applied vs duplicate vs dead-lettered-again counts
+        instead of a single total.
+        """
+        rows = self._conn.execute(
+            "SELECT group_name, outcome, COUNT(*) AS n "
+            "FROM dead_letter_replay_outcomes "
+            "GROUP BY group_name, outcome"
+        ).fetchall()
+        totals: dict[str, dict[str, int]] = {}
+        for r in rows:
+            totals.setdefault(r["group_name"], {})[r["outcome"]] = int(r["n"])
+        return totals
+
+    @staticmethod
+    def _stored_replay_outcome_from_row(r) -> StoredReplayOutcome:
+        return StoredReplayOutcome(
+            outcome_id=int(r["id"]),
+            replay_id=int(r["replay_id"]),
+            dead_letter_id=int(r["dead_letter_id"]),
+            group=r["group_name"],
+            event_id=r["event_id"],
+            outcome=r["outcome"],
+            new_dead_letter_id=(int(r["new_dead_letter_id"])
+                                if r["new_dead_letter_id"] is not None else None),
+            consumption_run_id=(int(r["consumption_run_id"])
+                                if r["consumption_run_id"] is not None else None),
+            recorded_at=r["recorded_at"],
         )
 
     # --- read views (fresh snapshots from the DB) -----------------------

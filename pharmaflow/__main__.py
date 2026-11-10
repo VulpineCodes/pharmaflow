@@ -76,6 +76,14 @@ def main(argv=None) -> int:
     p_dlrs.add_argument("--latest", action="store_true", help="Show only the most recent replay")
     p_dlrs.add_argument("--limit", type=int, default=20, help="Replays to show (default: 20, max: 100)")
     p_dlrs.add_argument("--json", action="store_true", help="Print replays as JSON instead of human-readable lines")
+    p_ro = sub.add_parser("replay-outcomes", help="List recorded replay outcomes, newest first (M14)")
+    p_ro.add_argument("--db", required=True, help="SQLite database file written by a previous `stream-consume` run")
+    p_ro.add_argument("--replay-id", type=int, default=None, help="Show only outcomes for this replay")
+    p_ro.add_argument("--group", default=None, help="Show only outcomes for this consumer group")
+    p_ro.add_argument("--outcome", default=None, choices=["applied", "duplicate", "dead_lettered"], help="Show only outcomes with this result")
+    p_ro.add_argument("--latest", action="store_true", help="Show only the most recent outcome")
+    p_ro.add_argument("--limit", type=int, default=20, help="Outcomes to show (default: 20, max: 100)")
+    p_ro.add_argument("--json", action="store_true", help="Print outcomes as JSON instead of human-readable lines")
     p_sm = sub.add_parser("stream-metrics", help="Prometheus text for stream lag + DLQ size, read from the broker (M8)")
     p_sm.add_argument("--log-dir", required=True, help="Broker log directory written by stream-produce")
     p_sm.add_argument("--group", action="append", default=[], help="Consumer group to report lag for (repeatable; omit for DLQ only)")
@@ -112,6 +120,45 @@ def main(argv=None) -> int:
             print(f"Recorded as stream consumption #{result.record_id} (group {args.group})")
         if result.dead_letter_ids:
             print(f"Recorded {len(result.dead_letter_ids)} dead letter(s) (group {args.group})")
+        if result.replay_outcome_ids:
+            print(f"Recorded {len(result.replay_outcome_ids)} replay outcome(s) (group {args.group})")
+        return 0
+    if args.cmd == "replay-outcomes":
+        import json as _json
+        if not Path(args.db).exists():
+            print(f"ERROR: database not found: {args.db}"); return 2
+        store = SqliteStore(args.db)
+        try:
+            if args.latest:
+                latest = store.latest_replay_outcome(
+                    replay_id=args.replay_id, group=args.group)
+                outcomes = [latest] if latest is not None else []
+            else:
+                outcomes = store.list_replay_outcomes(
+                    replay_id=args.replay_id, group=args.group,
+                    outcome=args.outcome, limit=args.limit)
+        finally:
+            store.close()
+        if args.json:
+            print(_json.dumps([
+                {"outcome_id": o.outcome_id, "replay_id": o.replay_id,
+                 "dead_letter_id": o.dead_letter_id, "group": o.group,
+                 "event_id": o.event_id, "outcome": o.outcome,
+                 "new_dead_letter_id": o.new_dead_letter_id,
+                 "consumption_run_id": o.consumption_run_id,
+                 "recorded_at": o.recorded_at}
+                for o in outcomes
+            ], indent=2, default=str))
+            return 0
+        if not outcomes:
+            print("No replay outcomes recorded.")
+            return 0
+        for o in outcomes:
+            extra = (f" new_dead_letter=#{o.new_dead_letter_id}"
+                     if o.new_dead_letter_id is not None else "")
+            print(f"#{o.outcome_id} replay=#{o.replay_id} dead_letter=#{o.dead_letter_id} "
+                  f"group={o.group} event_id={o.event_id or '(none)'} outcome={o.outcome} "
+                  f"consumption_run=#{o.consumption_run_id}{extra} recorded_at={o.recorded_at}")
         return 0
     if args.cmd == "dead-letter-replay":
         import json as _json

@@ -608,6 +608,39 @@ class DeadLetter:
 
 
 @dataclass
+class EventOutcome:
+    """One record's disposition in a consume run (M14).
+
+    The consumer appends one of these per record it processes, in
+    consume order, so a completed run can say — per record, not just
+    per run — what happened: ``applied``, ``duplicate`` (redelivered,
+    recognised by event id), or ``dead_lettered`` (poison, written to
+    the DLQ topic). ``event_id`` may be empty when the record failed
+    to parse badly enough that no id could be recovered; the source
+    coordinates (topic/partition/offset) always identify the record.
+    These are the raw material for replay-outcome linkage: a
+    re-published replay sits at known broker coordinates, so the
+    outcome of the record at those coordinates *is* the replay's
+    outcome.
+    """
+
+    event_id: str
+    outcome: str  # "applied" | "duplicate" | "dead_lettered"
+    topic: str
+    partition: int
+    offset: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "outcome": self.outcome,
+            "topic": self.topic,
+            "partition": self.partition,
+            "offset": self.offset,
+        }
+
+
+@dataclass
 class ConsumeResult:
     group: str
     topic: str
@@ -627,6 +660,13 @@ class ConsumeResult:
     # consume_once has persisted them (empty when not recorded).
     dead_letters: list[DeadLetter] = field(default_factory=list)
     dead_letter_ids: list[int] = field(default_factory=list)
+    # M14: one outcome per record processed, in consume order (see
+    # EventOutcome). Populated during the run whether or not the run
+    # is recorded; ``replay_outcome_ids`` holds the store row ids
+    # once consume_once has linked them to replays (empty when not
+    # recorded, or when the run processed no replayed record).
+    event_outcomes: list[EventOutcome] = field(default_factory=list)
+    replay_outcome_ids: list[int] = field(default_factory=list)
 
     @property
     def skipped(self) -> int:
@@ -820,10 +860,19 @@ class StreamingConsumer:
                 except EventValidationError as exc:
                     result.dead_letters.append(self._dead_letter(record, exc.errors))
                     result.dlq += 1
+                    result.event_outcomes.append(EventOutcome(
+                        event_id=str(record.value.get("event_id") or ""),
+                        outcome="dead_lettered",
+                        topic=record.topic, partition=record.partition,
+                        offset=record.offset))
                     new_offsets[partition] = record.offset + 1
                     continue
                 if _is_processed(self.store, event.event_id):
                     result.duplicates += 1
+                    result.event_outcomes.append(EventOutcome(
+                        event_id=event.event_id, outcome="duplicate",
+                        topic=record.topic, partition=record.partition,
+                        offset=record.offset))
                     new_offsets[partition] = record.offset + 1
                     continue
                 try:
@@ -831,6 +880,10 @@ class StreamingConsumer:
                 except EventValidationError as exc:
                     result.dead_letters.append(self._dead_letter(record, exc.errors))
                     result.dlq += 1
+                    result.event_outcomes.append(EventOutcome(
+                        event_id=event.event_id, outcome="dead_lettered",
+                        topic=record.topic, partition=record.partition,
+                        offset=record.offset))
                     new_offsets[partition] = record.offset + 1
                     continue
                 # Dedupe marker is persisted NOW, before any offset
@@ -838,6 +891,10 @@ class StreamingConsumer:
                 _mark_processed(self.store, event)
                 result.applied += 1
                 applied_this_run += 1
+                result.event_outcomes.append(EventOutcome(
+                    event_id=event.event_id, outcome="applied",
+                    topic=record.topic, partition=record.partition,
+                    offset=record.offset))
                 new_offsets[partition] = record.offset + 1
                 if crash_after_applies is not None and applied_this_run >= crash_after_applies:
                     raise SimulatedCrashError(
@@ -870,6 +927,16 @@ def consume_once(log_dir: str | Path, db_path: str | Path, group: str,
     that dead-lettered it — the same per-run semantics as the
     duplicates column. The broker DLQ topic still receives the record
     during the run regardless of recording (M4 behaviour, unchanged).
+
+    M14: the same completion rule applies to replay outcomes. For
+    every record the completed run processed that sits at the broker
+    coordinates of a recorded, still-unresolved replay *for this
+    group*, one outcome row is appended to
+    ``dead_letter_replay_outcomes`` (applied / duplicate /
+    dead-lettered again, with the new dead-letter row id when the
+    replayed event was dead-lettered again, and the consumption run
+    id), and its row id is collected on
+    ``result.replay_outcome_ids``. A run that raises records nothing.
     """
     from .sqlite_store import SqliteStore
     broker = FileLogBroker(log_dir)
@@ -883,9 +950,109 @@ def consume_once(log_dir: str | Path, db_path: str | Path, group: str,
             result.dead_letter_ids = [
                 store.record_dead_letter(dl) for dl in result.dead_letters
             ]
+        if record and hasattr(store, "record_replay_outcome"):
+            result.replay_outcome_ids = _record_replay_outcomes(store, result)
         return result
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Replay outcome linkage (M14)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReplayOutcome:
+    """What the next consume run did with a re-published replay (M14).
+
+    One row per (replay, group): the outcome the replay's group's
+    next *completed* consume run recorded for the re-published
+    record — ``applied``, ``duplicate`` (a second copy of a double
+    replay, or an event another group already applied first: the
+    dedupe table is per-store, not per-group, see M11), or
+    ``dead_lettered`` (the replayed event still failed at apply
+    time). ``new_dead_letter_id`` is the row id of the fresh dead
+    letter when the outcome is ``dead_lettered`` — the link back
+    from the new poison event to the replay that produced it — and
+    ``None`` otherwise. ``consumption_run_id`` is the recorded
+    consume run that decided the outcome. ``outcome_id`` is the
+    store row id once the outcome has been recorded (``None``
+    before recording). A replay with no outcome row has simply not
+    been consumed yet: it is pending, not failed.
+    """
+
+    replay_id: int
+    dead_letter_id: int
+    group: str
+    event_id: str
+    outcome: str  # "applied" | "duplicate" | "dead_lettered"
+    new_dead_letter_id: int | None = None
+    consumption_run_id: int | None = None
+    outcome_id: int | None = None
+    recorded_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "outcome_id": self.outcome_id,
+            "replay_id": self.replay_id,
+            "dead_letter_id": self.dead_letter_id,
+            "group": self.group,
+            "event_id": self.event_id,
+            "outcome": self.outcome,
+            "new_dead_letter_id": self.new_dead_letter_id,
+            "consumption_run_id": self.consumption_run_id,
+            "recorded_at": self.recorded_at,
+        }
+
+
+def _record_replay_outcomes(store, result: ConsumeResult) -> list[int]:
+    """Link a completed consume run's per-record outcomes to replays.
+
+    For every record the run processed, look up a recorded replay
+    sitting at that record's broker coordinates (topic/partition/
+    offset) for this group that has no outcome yet, and record what
+    the run did with it. Coordinates — not the event id — are the
+    link key, because they identify the re-published record even
+    when the run could not recover its event id (a record that
+    fails to parse badly enough carries no id at all). The
+    outcome's event id is the replay's own id: the record at those
+    coordinates *is* the re-published record.
+
+    Only the replay's own group gets an outcome: another group
+    consuming the same topic sees the replayed event as its own
+    business (usually a duplicate, per-store dedupe), not as the
+    replay's fate. A crash-interrupted run never reaches here, so
+    an event applied pre-crash and redelivered afterwards is seen
+    as a duplicate by the recovery run — and that is what is
+    recorded, because the outcome describes what the completed run
+    did, not what the interrupted one attempted.
+    """
+    # Map (topic, partition, offset) -> the new dead-letter row id,
+    # for poison events this run dead-lettered (consume order).
+    new_dead_letter_ids: dict[tuple[str, int, int], int] = {}
+    for dead_letter, row_id in zip(result.dead_letters, result.dead_letter_ids):
+        new_dead_letter_ids[(dead_letter.source_topic,
+                             dead_letter.source_partition,
+                             dead_letter.source_offset)] = row_id
+    outcome_ids: list[int] = []
+    for event_outcome in result.event_outcomes:
+        replay = store.find_unresolved_replay_at_coordinates(
+            event_outcome.topic, event_outcome.partition,
+            event_outcome.offset, result.group)
+        if replay is None:
+            continue
+        outcome_ids.append(store.record_replay_outcome(ReplayOutcome(
+            replay_id=replay.replay_id,
+            dead_letter_id=replay.dead_letter_id,
+            group=result.group,
+            event_id=replay.event_id,
+            outcome=event_outcome.outcome,
+            new_dead_letter_id=new_dead_letter_ids.get(
+                (event_outcome.topic, event_outcome.partition,
+                 event_outcome.offset)),
+            consumption_run_id=result.record_id,
+        )))
+    return outcome_ids
 
 
 # ---------------------------------------------------------------------------
@@ -967,6 +1134,10 @@ def replay_dead_letter(log_dir: str | Path, db_path: str | Path,
     group and shows up in its consumption history — replaying the
     same dead letter twice is safe: the second copy is deduplicated
     by event id at consume time.
+
+    M14: that outcome is now also linked to the replay itself — see
+    :class:`ReplayOutcome` and :func:`consume_once`. A replay with
+    no outcome row simply has not been consumed yet (pending).
     """
     from .sqlite_store import SqliteStore
     if corrections is not None and not isinstance(corrections, dict):

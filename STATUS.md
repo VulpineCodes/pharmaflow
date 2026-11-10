@@ -47,9 +47,9 @@ alone.
   before M9, version 2 from M9).
   Ingestion runs against `StoreProtocol`; the in-memory `PharmaStore`
   remains for unit tests and now implements the same interface.
-- Tests: **114 passed** as of M13 (`python -m pytest -q` in the local
-  venv, Python 3.12, pytest 9.1.1). That is 101 through M12 plus 13 M13
-  dead-letter-replay tests. See the M13 section below.
+- Tests: **126 passed** as of M14 (`python -m pytest -q` in the local
+  venv, Python 3.12, pytest 9.1.1). That is 114 through M13 plus 12 M14
+  replay-outcome-linkage tests. See the M14 section below.
   Environment note: system pip is externally managed (PEP 668), so all
   M3 work ran in the gitignored `.venv/` (`python3 -m venv .venv`).
 - CLI (in-memory): `python -m pharmaflow ingest sample_data/inventory.csv sample_data/sales.csv sample_data/inventory_with_errors.csv --today 2026-10-22`
@@ -835,11 +835,148 @@ alone.
   letter row; there is no automatic link from the new dead letter
   back to the replay that produced it (the event id is the same,
   so the two rows are correlatable by id, not by a foreign key).
+  **Superseded by M14 below:** the outcome row links the new dead
+  letter to the replay that produced it.
 - Replays are recorded only when `replay_dead_letter` is used
   (CLI/API); a corrected event published by hand through
   `stream-produce` is a normal event, not a replay, and is not
   linked to any dead letter.
 - The Postgres store does not persist replays (its schema stays
+  at version 1; the path is code-only and unverified in any case).
+
+## M14: replay outcome linkage (2026-11-09)
+
+### What was built: EXECUTED
+
+- Schema version **5 to 6**: `dead_letter_replay_outcomes` table
+  added (`id`, `replay_id`, `dead_letter_id`, `group_name`,
+  `event_id`, `outcome`, `new_dead_letter_id`, `consumption_run_id`,
+  `recorded_at`, plus `UNIQUE (replay_id, group_name)`). Migration
+  is additive: `CREATE TABLE IF NOT EXISTS` plus a version bump in
+  `_init_schema`; no existing table or row is altered. A hand-built
+  v5 database (frozen v5 schema plus one inventory row) opens as v6
+  with its row intact, then records replays and outcomes normally.
+- `streaming.EventOutcome` (one record's disposition in a consume
+  run: applied / duplicate / dead_lettered, with source
+  topic/partition/offset) is now collected on `ConsumeResult`
+  (`event_outcomes`, in consume order) by
+  `StreamingConsumer.consume_until_caught_up`; `consume_once`
+  links each processed record to the recorded replay sitting at
+  its broker coordinates for the run's group, and records one
+  outcome row per unresolved replay. The link key is the broker
+  coordinates, not the event id: coordinates identify the
+  re-published record even when the run could not recover its event
+  id. Only the replay's own group gets an outcome — another group
+  consuming the same topic sees the replayed event as its own
+  business (usually a duplicate, since the dedupe table is
+  per-store, M11), not as the replay's fate. A crash-interrupted
+  run records nothing (same completion rule as M11/M12); an event
+  applied pre-crash and redelivered afterwards is recorded as a
+  duplicate by the recovery run, because the outcome describes
+  what the completed run did.
+- `streaming.ReplayOutcome` dataclass plus the store API on
+  `SqliteStore`: `record_replay_outcome` (returns the outcome id;
+  a second recording for the same (replay, group) raises on the
+  UNIQUE constraint instead of overwriting), `get_replay_outcome`
+  (None means pending, not failed),
+  `find_unresolved_replay_at_coordinates` (the lookup
+  `consume_once` uses), `latest_replay_outcome`,
+  `list_replay_outcomes` (filters `replay_id`/`group`/`outcome`,
+  newest-first, clamped 1 to 100), `count_replay_outcomes`, and
+  `replay_outcome_totals_by_group()` (one GROUP BY query). Also
+  `get_dead_letter_replay(replay_id)` for the single-replay
+  endpoint. A recording failure raises rather than silently losing
+  the record.
+- `pharmaflow/observability.py`:
+  `render_replay_outcomes_prometheus` renders per-group,
+  per-outcome `pharmaflow_dead_letter_replay_outcomes_total`
+  gauges; an empty mapping renders nothing. A replay with no
+  outcome row (not consumed yet) contributes to no count.
+- API (version 0.9.0): `GET /replay-outcomes` (newest first,
+  `?replay_id=`, `?group=`, `?outcome=`, limit clamped 1 to 100),
+  `GET /replay-outcomes/latest` (404 when no outcome exists),
+  `GET /dead-letter-replays/{replay_id}` (the replay with its
+  outcomes embedded; empty list while pending; 404 unknown id),
+  and `/metrics` renders the per-group, per-outcome totals when any
+  outcome is recorded. No recorded outcome means no outcome gauge,
+  as before.
+- CLI: `stream-consume` now prints
+  `Recorded N replay outcome(s) (group ...)` when the completed run
+  linked any; new `replay-outcomes --db <file> [--replay-id N]
+  [--group G] [--outcome O] [--latest] [--limit N] [--json]`.
+- Docs: `docs/OBSERVABILITY.md` updated (new metrics table row,
+  new M14 section, revised limits); README updated (endpoints, M14
+  section, test count).
+
+### Evidence: EXECUTED (`tests/test_m14.py`, 12 tests)
+
+- Corrected sale replay applies on the next consume: outcome #1
+  (replay 1, dead letter 1, event evt-poison-1, applied,
+  new_dead_letter_id None, consumption_run_id 2); MED-001 100 to
+  95. The per-record outcomes on the result itself are asserted
+  (applied evt-1, dead-lettered evt-poison-1, partition 2,
+  offsets 0 and 1).
+- Double replay: two outcome rows, replay #1 applied and replay #2
+  duplicate, same consumption run; MED-001 ends at 95, not 90.
+- Dead-lettered again: a state-failure replay (sale for unknown
+  SKU, replayed unchanged) is dead-lettered again as new dead
+  letter #2; the outcome carries new_dead_letter_id 2 and the new
+  dead letter's event id and errors; stocking the SKU and replaying
+  dead letter #2 then applies (MED-009 50 to 43) with a second
+  outcome row (applied).
+- Pending: a recorded replay with no consume yet has no outcome
+  rows (`get_replay_outcome` None, list empty, totals empty).
+- Crash run records nothing: consumer with `crash_after_applies=1`
+  applies the replayed event then raises; history stays empty;
+  recovery `consume_once` records the outcome as duplicate
+  (consumption run #2), MED-001 stays 95.
+- Outcome scoped to the replay's group: another group consuming
+  first applies the event but records no outcome; the replay's own
+  group then sees it as a duplicate and records exactly that.
+- v5 migration test passes; store API filtering/limit-clamping
+  and per-group, per-outcome totals asserted; a second outcome for
+  the same (replay, group) raises `sqlite3.IntegrityError`.
+  Prometheus render asserted (all three outcomes across two
+  groups; empty mapping renders nothing).
+- CLI: `stream-produce` + `stream-consume` + `dead-letter-replay`
+  + second consume asserted end to end (prints the replay-outcome
+  record line); `replay-outcomes --json` and `--latest` asserted;
+  outcome filter and unknown replay id print "No replay outcomes
+  recorded."
+- API: empty history gives `[]` plus 404 plus no outcome gauge
+  plus 404 for the single-replay endpoint; after a replay the
+  single endpoint shows outcomes `[]` (pending); after the consume
+  it shows the applied outcome, `/replay-outcomes` serves it, and
+  `/metrics` carries
+  `pharmaflow_dead_letter_replay_outcomes_total{group="reconciliation-v1",outcome="applied"} 1`;
+  a second app instance on the same DB serves the same history and
+  gauge.
+- Live check beyond the tests: real CLI produce (2 events) →
+  consume (applied 1, dlq 1) → `dead-letter-replay
+  --corrections '{"quantity_sold": 5}'` (replay #1, offset 2) →
+  consume (applied 1, `Recorded 1 replay outcome(s)`) →
+  `replay-outcomes --json` and `--latest` listed outcome #1
+  (applied, consumption_run_id 2); a real uvicorn server served
+  `/replay-outcomes`, `/dead-letter-replays/1` (with the outcome
+  embedded), and `/metrics` with the outcome gauge, and
+  `/dead-letter-replays/99` returned 404.
+- **Tests: 126 passed** (114 previous, all still green, plus 12
+  M14). The M9/M11/M12/M13 tests and the SQLite-store schema test
+  that asserted `schema_version == 5` were updated to 6 (the
+  current version); no behaviour changed, only the version
+  constant.
+
+### Still NOT done (stated plainly)
+
+- An outcome describes what the replay's group's next *completed*
+  consume run did. A replayed event applied by a different group
+  first (per-store dedupe, M11) is recorded as a duplicate for the
+  replay's own group; the applying group's run is visible in its
+  own consumption history, not in the outcome row.
+- Outcomes are recorded only for replays made through
+  `replay_dead_letter` (CLI/API); a corrected event published by
+  hand through `stream-produce` is a normal event, not a replay.
+- The Postgres store does not persist outcomes (its schema stays
   at version 1; the path is code-only and unverified in any case).
 
 ## Acceptance check (foundation slice)
@@ -1053,6 +1190,19 @@ alone.
   Double replay is deduped by event id at consume time; a replayed
   event that still fails at apply time is dead-lettered again as a
   new row. The Postgres store does not persist replays.
+- **M14: Replay outcome linkage (done, 2026-11-09):** the next
+  completed consume run's disposition of each re-published record
+  is recorded per (replay, group) in a
+  `dead_letter_replay_outcomes` table (schema v6, additive v5 to v6
+  migration tested) — applied, duplicate, or dead-lettered again,
+  with the new dead-letter row id when applicable and the
+  consumption run id; `GET /replay-outcomes[/latest]`, `GET
+  /dead-letter-replays/{replay_id}` (replay with outcomes
+  embedded), `replay-outcomes` CLI, and per-group, per-outcome
+  `pharmaflow_dead_letter_replay_outcomes_total` gauges on
+  `/metrics` (API 0.9.0) serve the stored history; 126 tests green.
+  A replay with no outcome row has not been consumed yet
+  (pending). The Postgres store does not persist outcomes.
 
 ## Next actionable task
 
@@ -1063,21 +1213,19 @@ scenarios against `PostgresStore`; (2) real Redpanda: the
 (a) push to GitHub so the CI workflow (incl. the dbt job) actually
 runs — the workflow file is still absent from the public branch
 (verified 2026-10-28; the GitHub App lacks workflows permission, so
-it needs a permission grant or a web-UI upload by Franklin). M8, M9,
-M10, and the audit are already on GitHub (remote head 3802646d,
-verified 2026-11-01); M11 and M12 are the next push.
+it needs a permission grant or a web-UI upload by Franklin). M8
+through M13 are already on GitHub (remote head 9639a00b, verified
+2026-11-07); M14 is the next push.
 (b) recording runs executed under Airflow (DAG wires task callables,
 not `run_daily`) is future work, not claimed.
-(c) **M14 candidate — replay outcome linkage:** a replayed event
-  that still fails at apply time is dead-lettered again as a new
-  row, but nothing links that new dead letter back to the replay
-  that produced it (the event id is the same, so the rows are
-  correlatable by id only). Record, per replay, what the next
-  consume run did with the re-published event — applied, duplicate,
-  or dead-lettered again (with the new dead-letter id when
-  applicable) — so an operator can close the loop without
-  cross-referencing two histories by event id.
-(Done in M13: dead-letter replay. Done in M12: durable dead-letter history. Done in M11: durable
+(c) **M15 candidate — outcome status on the replay listing:**
+  `GET /dead-letter-replays` (and the CLI) currently returns
+  replays without their outcomes; an operator listing replays must
+  call `/replay-outcomes` (or one single-replay call per replay) to
+  learn which are pending, applied, duplicated, or dead-lettered
+  again. Attach each replay's latest outcome (or `pending`) to the
+  listing rows, so one call answers the whole queue.
+(Done in M14: replay outcome linkage. Done in M13: dead-letter replay. Done in M12: durable dead-letter history. Done in M11: durable
 stream-consumption history. Done in M10:
 durable ingestion counters. Done in M9: durable pipeline-run
 history. Done in M8: pipeline/streaming metrics: consumer lag and

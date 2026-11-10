@@ -198,7 +198,10 @@ offsets commit, and later valid events still process.
 `/stream-consumption` and `/stream-consumption/latest`, and (from M12)
 `/dead-letters` and `/dead-letters/latest`, and (from M13)
 `POST /dead-letters/{id}/replay`, `/dead-letter-replays`, and
-`/dead-letter-replays/latest`. The API was verified
+`/dead-letter-replays/latest`, and (from M14)
+`/replay-outcomes`, `/replay-outcomes/latest`, and
+`GET /dead-letter-replays/{replay_id}` (one replay with its
+outcomes embedded). The API was verified
 live under uvicorn and by 9 TestClient tests, including a second
 app instance on the same database file reading inventory back.
 Serving from a threadpool surfaced one real fix: `SqliteStore`
@@ -324,7 +327,38 @@ it is consumed, which is verified by test (applied 1, duplicates
 corrected event was applied is decided by the next `stream-consume`
 run and shows up in its consumption history; a replayed event that
 still fails at apply time is dead-lettered again as a new row.
+Since M14 that new dead letter is linked back to the replay that
+produced it through the outcome row (see below).
 The Postgres store does not persist replays.
+
+### Replay outcome linkage (M14)
+
+Schema version 5 to 6 adds a `dead_letter_replay_outcomes` table;
+the migration is additive in the same way (a hand-built version 5
+database opens as version 6 with its rows intact). When a completed
+`stream-consume` run processes a re-published record, one outcome
+row is appended per (replay, group): the outcome — `applied`,
+`duplicate` (a second copy of a double replay, or an event another
+group already applied first, since the dedupe table is per-store),
+or `dead_lettered` — the new dead-letter row id when the replayed
+event was dead-lettered again, and the consumption run id that
+decided it. The link key is the broker coordinates of the
+re-published record (topic/partition/offset), not the event id, so
+the record is identified even when the run could not recover its
+event id. Only the replay's own group gets an outcome; a run
+interrupted mid-consume records nothing, so an event applied
+pre-crash and redelivered afterwards is recorded as a duplicate by
+the recovery run. One outcome per (replay, group) is enforced by a
+UNIQUE constraint, so a replay's outcome is decided once and never
+overwritten. A replay with no outcome row has not been consumed yet
+(pending). History is served by `GET /replay-outcomes` (newest
+first, optional `?replay_id=` / `?group=` / `?outcome=`, limit
+clamped to 1 to 100), `GET /replay-outcomes/latest` (404 when no
+outcome exists), `GET /dead-letter-replays/{replay_id}` (the replay
+with its outcomes embedded; 404 for an unknown id), the
+`replay-outcomes` CLI, and per-group, per-outcome totals
+(`pharmaflow_dead_letter_replay_outcomes_total`) on `/metrics`. The
+Postgres store does not persist outcomes.
 
 ## Layout
 
@@ -334,13 +368,14 @@ pharmaflow/     core: ingestion, validation, quarantine, reconciliation, alerts,
                 data-quality report (M2), analytics.py (DuckDB, M3), transform.py (dbt model SQL, M3),
                 orchestration.py (task callables plus local runner, M3), streaming.py (M4: FileLogBroker
                 tested, Kafka adapter not run, idempotent consumer, DLQ), observability.py (M8: lag, DLQ,
-                and pipeline gauges in Prometheus text; M11: stream-consumption gauges; M12: dead-letter gauges; M13: dead-letter replay totals)
+                and pipeline gauges in Prometheus text; M11: stream-consumption gauges; M12: dead-letter gauges; M13: dead-letter replay totals; M14: replay-outcome gauges)
 api/            FastAPI serving layer (M5: SQLite-backed via PHARMAFLOW_DB, verified live and by tests;
                 pipeline-runs endpoints added in M9; stream-consumption endpoints added in M11;
-                dead-letters endpoints added in M12; dead-letter replay endpoints added in M13)
+                dead-letters endpoints added in M12; dead-letter replay endpoints added in M13;
+                replay-outcome endpoints added in M14)
 benchmarks/     run_benchmarks.py and RESULTS.md with documented conditions (M6, M7, reproduction run)
 sample_data/    synthetic CSVs, including deliberately bad and duplicate rows; stream_events.jsonl (M4)
-tests/          pytest suite, 114 tests through M13
+tests/          pytest suite, 126 tests through M14
 db/             SQL migrations: 001 initial schema, Postgres dialect (M2, not run locally)
 dbt/            transformation project, executed in M3 (seed, run, and test green on DuckDB)
 airflow/        daily DAG: wiring only; task logic in pharmaflow/orchestration.py (M3, DAG not run)

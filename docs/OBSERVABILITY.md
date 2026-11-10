@@ -1,4 +1,4 @@
-# PharmaFlow observability (M8, M9, M10, M11, M12, M13)
+# PharmaFlow observability (M8, M9, M10, M11, M12, M13, M14)
 
 ## What is exposed, and where it comes from
 
@@ -15,6 +15,7 @@
 | `pharmaflow_stream_consumed_read_total{group}` / `pharmaflow_stream_consumed_applied_total{group}` / `pharmaflow_stream_consumed_duplicates_total{group}` / `pharmaflow_stream_consumed_dlq_total{group}` | Sums over completed, recorded consume runs for a group | Same table (M11); sums, not live broker state |
 | `pharmaflow_dead_letters_total{group}` | Poison events dead-lettered by completed consume runs for a group | `dead_letters` table (M12); count per group, not live broker state |
 | `pharmaflow_dead_letter_replays_total{group}` | Corrected re-publishes of recorded dead letters for a group | `dead_letter_replays` table (M13); count per group — a re-publish, not a claim the event was applied |
+| `pharmaflow_dead_letter_replay_outcomes_total{group,outcome}` | What the next completed consume run did with each replayed event, per group and outcome (`applied` / `duplicate` / `dead_lettered`) | `dead_letter_replay_outcomes` table (M14); a replay with no outcome row (not consumed yet) contributes to no count |
 | `pharmaflow_pipeline_succeeded` (unlabeled) | 1/0 for an in-memory `PipelineResult` | `render_pipeline_prometheus` without a label (M8 form, unchanged) |
 
 The streaming numbers are deliberately **not** a second counter: they
@@ -199,6 +200,50 @@ returns 404 when no replay has been recorded yet, and `/metrics`
 serves no replay gauge in that case. The Postgres store does not
 persist replays (code-only path, unverified).
 
+## Replay outcomes close the loop (M14)
+
+The M13 gauge says a replay was re-published; it does not say what
+happened next. M14 records exactly that, per replay, when the
+replay's group's next *completed* `stream-consume` run processes
+the re-published record:
+
+```bash
+python -m pharmaflow replay-outcomes --db pharmaflow.db --json
+python -m pharmaflow replay-outcomes --db pharmaflow.db --replay-id 1 --latest
+curl localhost:8000/replay-outcomes/latest
+curl localhost:8000/dead-letter-replays/1   # the replay, with its outcomes embedded
+curl localhost:8000/metrics   # per-group, per-outcome totals
+```
+
+One outcome row is appended to the `dead_letter_replay_outcomes`
+table (schema version 6. Opening a version-5 database migrates
+additively: a new table only, existing rows untouched, version
+bumped to 6) per (replay, group): the outcome — `applied`,
+`duplicate`, or `dead_lettered` — the new dead-letter row id when
+the replayed event was dead-lettered again, and the consumption
+run id that decided it. A replay with no outcome row has not been
+consumed yet: it is pending, not failed, and contributes to no
+outcome count. `GET /dead-letter-replays/{id}` returns 404 for an
+unknown replay id, and `GET /replay-outcomes/latest` returns 404
+when no outcome has been recorded yet; `/metrics` serves no outcome
+gauge in that case.
+
+The link key is the broker coordinates of the re-published record
+(topic/partition/offset), not the event id: coordinates identify
+the record even when the run could not recover its event id. Only
+the replay's own group gets an outcome — another group consuming
+the same topic sees the replayed event as its own business
+(usually a duplicate, since the dedupe table is per-store, see
+M11), not as the replay's fate. A run interrupted mid-consume
+(including the crash-simulation hook) records nothing, so an event
+applied pre-crash and redelivered afterwards is seen as a
+duplicate by the recovery run — and that is what is recorded,
+because the outcome describes what the completed run did. One
+outcome per (replay, group) is enforced by a UNIQUE constraint: a
+replay's outcome is decided once and never overwritten. The
+Postgres store does not persist outcomes (code-only path,
+unverified).
+
 ## Honest limits
 
 - Stream-consumption gauges sum over recorded, completed runs only;
@@ -214,7 +259,10 @@ persist replays (code-only path, unverified).
   apply an event directly, so a replayed event that still fails at
   apply time is dead-lettered again by the next consume run as a
   *new* dead-letter row. The replay gauge counts re-publishes, not
-  applications.
+  applications. Since M14 that new dead letter is linked back to
+  the replay that produced it through the outcome row
+  (`new_dead_letter_id`), so the chain dead letter -> replay ->
+  outcome -> new dead letter is traversable from one record.
 - Ingestion counters are durable from M10 onward (see above); the
   per-process session counters still exist in-memory and are what the
   foundation tests assert. The durable view is the one `/metrics`

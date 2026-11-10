@@ -155,7 +155,7 @@ def test_consume_once_records_completed_run(tmp_path):
     assert result.record_id == 1
     # A fresh store instance on the same file sees the recorded run.
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         assert store.count_stream_consumption() == 1
         latest = store.latest_stream_consumption()
         assert latest is not None
@@ -233,7 +233,7 @@ def test_v2_database_migrates_additively(tmp_path):
     db = tmp_path / "pharma.db"
     _make_v2_db(db)
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         # Pre-existing data survived the migration untouched.
         assert len(store.inventory) == 1
         assert store.inventory["MED-001"].quantity_on_hand == 120
@@ -245,7 +245,7 @@ def test_v2_database_migrates_additively(tmp_path):
     result = consume_once(log_dir, db, group=GROUP)
     assert result.record_id == 1
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         assert len(store.inventory) == 2  # consume added MED-002
         assert store.count_stream_consumption() == 1
 

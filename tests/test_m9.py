@@ -118,7 +118,7 @@ def test_run_daily_persists_successful_run(tmp_path):
     assert result.run_id == 1
     # A fresh store instance on the same file sees the recorded run.
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         assert store.count_pipeline_runs() == 1
         latest = store.latest_pipeline_run()
         assert latest is not None
@@ -188,7 +188,7 @@ def test_v1_database_migrates_additively(tmp_path):
     db = tmp_path / "pharma.db"
     _make_v1_db(db)
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         # Pre-existing data survived the migration untouched.
         assert len(store.inventory) == 1
         assert store.inventory["MED-001"].quantity_on_hand == 120
@@ -197,7 +197,7 @@ def test_v1_database_migrates_additively(tmp_path):
     result = run_daily(db, DATA_DIR, logical_date=REF, retries=2, today=REF)
     assert result.succeeded and result.run_id == 1
     with SqliteStore(db) as store:
-        assert store.schema_version == 5
+        assert store.schema_version == 6
         assert len(store.inventory) == 5  # ingest added the other SKUs
         assert store.count_pipeline_runs() == 1
 
